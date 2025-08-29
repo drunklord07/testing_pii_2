@@ -1,0 +1,318 @@
+# dedupe_gz_lines.py
+import os
+import sys
+import time
+import gzip
+import hashlib
+import shutil
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from tqdm import tqdm
+
+# ====== CONFIG ====== #
+INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs_gz"  # You can override via CLI arg
+RESUME_LOG   = "dedupe_resume.log"                      # in current directory
+SUMMARY_FILE = "nodupes_summary.txt"                    # in current directory
+DUPES_DUMP   = "duplicates_dump.txt.gz"                 # in current directory (aggregated)
+MAX_WORKERS  = 6
+SUMMARY_EVERY_SECS = 30
+GZIP_LEVEL   = 1                                        # fast & small enough
+MERGE_CHUNK  = 8 * 1024 * 1024                          # 8MB chunks for merging dupes
+READ_ENCODING = "utf-8"
+READ_ERRORS   = "ignore"                                # keep consistent with your other scripts
+# ==================== #
+
+summary = {
+    "start_ts": None,
+    "end_ts": None,
+    "input_folder": "",
+    "output_folder": "",
+    "files_found": 0,
+    "files_pending": 0,
+    "files_done": 0,
+    "files_error": 0,
+    "skipped_files": [],            # already in resume log
+    "blank_files": [],              # input had 0 lines
+    "zero_dupe_files": 0,           # files that had no duplicates
+    "errors": [],                   # "file: reason"
+    "lines_in_total": 0,
+    "lines_out_total": 0,
+    "dupes_total": 0,
+    "per_file_counts": {},          # name -> dict(lines_in, lines_out, dupes)
+}
+
+def load_completed_set(log_path: str) -> set:
+    done = set()
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                name = line.strip()
+                if name and not name.startswith("#"):
+                    done.add(name)
+    return done
+
+def append_completed(log_path: str, file_name: str):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(file_name + "\n")
+        f.flush()
+
+def ensure_output_folder(input_folder: str) -> str:
+    parent = os.path.dirname(os.path.abspath(input_folder))
+    base   = os.path.basename(os.path.abspath(input_folder))
+    outdir = os.path.join(parent, base + "_nodupes")
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+def _line_digest(s: str) -> bytes:
+    # MD5 (128-bit) over the exact text of the line (including any whitespace in the line).
+    # We hash the Python string encoded as UTF-8, consistent with reading.
+    return hashlib.md5(s.encode(READ_ENCODING, READ_ERRORS)).digest()
+
+def dedupe_one(src_path: str, dst_folder: str, tmp_dupes_folder: str) -> dict:
+    """
+    Deduplicate exact duplicate lines within a single .gz file.
+    Keep first occurrence; preserve original order.
+    Writes:
+      - Output data -> <dst_folder>/<base>.gz
+      - Per-file dupes -> <tmp_dupes_folder>/<base>.dups.gz (only if duplicates found)
+    Returns a dict with stats and (optional) path to the per-file dupes gz.
+    """
+    base = os.path.basename(src_path)
+    dst_path = os.path.join(dst_folder, base)
+    perfile_dupes_gz = os.path.join(tmp_dupes_folder, base + ".dups.gz")
+
+    out = {
+        "file_name": base,
+        "ok": False,
+        "lines_in": 0,
+        "lines_out": 0,
+        "dupes": 0,
+        "blank_input": False,
+        "error": None,
+        "dupes_path": None,
+    }
+
+    # Ensure no stale partials from past failed attempts
+    for p in (dst_path, perfile_dupes_gz):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+    try:
+        seen = set()
+        wrote_any = False
+        dup_writer = None  # lazy open on first duplicate
+
+        with gzip.open(src_path, "rt", encoding=READ_ENCODING, errors=READ_ERRORS) as fin, \
+             gzip.open(dst_path, "wt", encoding=READ_ENCODING, compresslevel=GZIP_LEVEL) as fout:
+
+            for line in fin:
+                out["lines_in"] += 1
+                # exact string identity (case, spaces) — we keep the line as is
+                d = _line_digest(line)
+                if d in seen:
+                    # duplicate — write to per-file dupes (filename<TAB>line)
+                    if dup_writer is None:
+                        os.makedirs(tmp_dupes_folder, exist_ok=True)
+                        dup_writer = gzip.open(perfile_dupes_gz, "wt",
+                                               encoding=READ_ENCODING, compresslevel=GZIP_LEVEL)
+                    dup_writer.write(f"{base}\t{line}")
+                    out["dupes"] += 1
+                else:
+                    seen.add(d)
+                    fout.write(line)
+                    out["lines_out"] += 1
+                    wrote_any = True
+
+        if dup_writer is not None:
+            dup_writer.close()
+            out["dupes_path"] = perfile_dupes_gz
+
+        if out["lines_in"] == 0:
+            out["blank_input"] = True
+            # empty output file already created
+
+        out["ok"] = True
+        return out
+
+    except Exception as e:
+        # cleanup partials so next run can retry
+        try:
+            if os.path.exists(dst_path):
+                os.remove(dst_path)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(perfile_dupes_gz):
+                os.remove(perfile_dupes_gz)
+        except Exception:
+            pass
+
+        err = f"{base}: {e.__class__.__name__}: {e}\n" + "".join(
+            traceback.format_exception_only(type(e), e)
+        ).strip()
+        out["error"] = err
+        return out
+
+def write_summary(all_gz, pending):
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write(f"De-dup Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Input Folder:  {summary['input_folder']}\n")
+        f.write(f"Output Folder: {summary['output_folder']}\n")
+        f.write(f"Resume Log:    {RESUME_LOG}\n")
+        f.write(f"Duplicates Log:{DUPES_DUMP}\n")
+        f.write(f"Max Workers:   {MAX_WORKERS}\n\n")
+
+        f.write("=== Discovery ===\n")
+        f.write(f"Total .gz found: {len(all_gz)}\n")
+        f.write(f"Pending at start: {len(pending)}\n")
+        f.write(f"Skipped (already in resume log): {len(summary['skipped_files'])}\n\n")
+
+        f.write("=== Progress (this run) ===\n")
+        f.write(f"Files processed OK: {summary['files_done']}\n")
+        f.write(f"Files error:        {summary['files_error']}\n")
+        f.write(f"Blank input files:  {len(summary['blank_files'])}\n")
+        f.write(f"Files with NO duplicates: {summary['zero_dupe_files']}\n\n")
+
+        f.write("=== Lines ===\n")
+        f.write(f"Total lines read:   {summary['lines_in_total']:,}\n")
+        f.write(f"Total lines written:{summary['lines_out_total']:,}\n")
+        f.write(f"Total duplicates removed: {summary['dupes_total']:,}\n\n")
+
+        if summary["skipped_files"]:
+            f.write("=== Skipped Files ===\n")
+            for s in summary["skipped_files"]:
+                f.write(f"- {s}\n")
+            f.write("\n")
+
+        if summary["per_file_counts"]:
+            f.write("=== Per-file counts ===\n")
+            # filename | in | out | dupes
+            for name in sorted(summary["per_file_counts"].keys()):
+                c = summary["per_file_counts"][name]
+                f.write(f"{name}\tlines_in={c['lines_in']}\tlines_out={c['lines_out']}\tdupes={c['dupes']}\n")
+            f.write("\n")
+
+        if summary["blank_files"]:
+            f.write("=== Blank Input Files ===\n")
+            for s in sorted(summary["blank_files"]):
+                f.write(f"- {s}\n")
+            f.write("\n")
+
+        if summary["errors"]:
+            f.write("=== Errors ===\n")
+            for err in summary["errors"]:
+                f.write(f"- {err}\n")
+
+def main():
+    # optional CLI arg to set input folder
+    in_arg = sys.argv[1] if len(sys.argv) > 1 else INPUT_FOLDER
+    if not os.path.isdir(in_arg):
+        print(f"ERROR: INPUT_FOLDER does not exist: {in_arg}", file=sys.stderr)
+        sys.exit(1)
+
+    summary["start_ts"] = time.time()
+    summary["input_folder"] = os.path.abspath(in_arg)
+    out_folder = ensure_output_folder(in_arg)
+    summary["output_folder"] = out_folder
+
+    # discover .gz (non-recursive, top level only)
+    all_gz = sorted(
+        os.path.join(in_arg, f)
+        for f in os.listdir(in_arg)
+        if f.endswith(".gz") and os.path.isfile(os.path.join(in_arg, f))
+    )
+    summary["files_found"] = len(all_gz)
+    if not all_gz:
+        print("No .gz files found in input folder.")
+        write_summary([], [])
+        return
+
+    # resume
+    done = load_completed_set(RESUME_LOG)
+    pending = [p for p in all_gz if os.path.basename(p) not in done]
+    summary["skipped_files"] = sorted([os.path.basename(p) for p in all_gz if os.path.basename(p) in done])
+    summary["files_pending"] = len(pending)
+
+    # prepare temp dupes folder (per-file dupes before aggregation)
+    tmp_dupes_folder = os.path.join(out_folder, "_dupes_tmp")
+    os.makedirs(tmp_dupes_folder, exist_ok=True)
+
+    # initial summary write
+    write_summary(all_gz, pending)
+
+    if not pending:
+        print("Nothing to do (all already processed per resume log).")
+        return
+
+    overall = tqdm(total=len(pending), desc="De-duplicating", unit="file", leave=True)
+    last_summary = time.time()
+
+    # ensure final dupes dump is clean
+    if os.path.exists(DUPES_DUMP):
+        try:
+            os.remove(DUPES_DUMP)
+        except Exception:
+            pass
+
+    try:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = {ex.submit(dedupe_one, p, out_folder, tmp_dupes_folder): p for p in pending}
+            for fut in as_completed(futs):
+                res = fut.result()
+                base = res["file_name"]
+
+                if res["ok"]:
+                    summary["files_done"] += 1
+                    summary["lines_in_total"]  += res["lines_in"]
+                    summary["lines_out_total"] += res["lines_out"]
+                    summary["dupes_total"]     += res["dupes"]
+                    if res["blank_input"]:
+                        summary["blank_files"].append(base)
+                    if res["dupes"] == 0:
+                        summary["zero_dupe_files"] += 1
+
+                    summary["per_file_counts"][base] = {
+                        "lines_in": res["lines_in"],
+                        "lines_out": res["lines_out"],
+                        "dupes": res["dupes"],
+                    }
+
+                    # append per-file dupes to the global dupes dump and delete temp
+                    if res["dupes_path"]:
+                        try:
+                            with open(DUPES_DUMP, "ab") as global_out, open(res["dupes_path"], "rb") as pf:
+                                shutil.copyfileobj(pf, global_out, length=MERGE_CHUNK)
+                        finally:
+                            try:
+                                os.remove(res["dupes_path"])
+                            except Exception:
+                                pass
+
+                    append_completed(RESUME_LOG, base)
+                else:
+                    summary["files_error"] += 1
+                    summary["errors"].append(res["error"])
+
+                overall.update(1)
+
+                if time.time() - last_summary >= SUMMARY_EVERY_SECS:
+                    write_summary(all_gz, pending)
+                    last_summary = time.time()
+
+    finally:
+        overall.close()
+        summary["end_ts"] = time.time()
+        # remove tmp dupes folder if empty
+        try:
+            if os.path.isdir(tmp_dupes_folder) and not os.listdir(tmp_dupes_folder):
+                os.rmdir(tmp_dupes_folder)
+        except Exception:
+            pass
+        write_summary(all_gz, pending)
+
+if __name__ == "__main__":
+    main()
