@@ -1,0 +1,248 @@
+# bulk_compress_txt_to_gz.py
+import os
+import sys
+import time
+import gzip
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from tqdm import tqdm
+
+# ====== CONFIG ====== #
+INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs"    # ✅ You can override via CLI arg
+RESUME_LOG   = "compress_resume.log"                   # in current dir
+SUMMARY_FILE = "compress_summary.txt"                  # in current dir
+MAX_WORKERS  = 6
+SUMMARY_EVERY_SECS = 30
+GZIP_LEVEL   = 1                                       # 1 = fastest (good for logs)
+READ_BUF     = 1024 * 1024                             # 1 MB
+WRITE_BUF    = 1024 * 1024                             # 1 MB
+# ==================== #
+
+summary = {
+    "start_ts": None,
+    "end_ts": None,
+    "input_folder": "",
+    "output_folder": "",
+    "files_found": 0,
+    "files_pending": 0,
+    "files_done": 0,
+    "files_error": 0,
+    "skipped_files": [],           # already in resume log
+    "blank_files": [],             # 0-line inputs
+    "errors": [],                  # "file: reason"
+    "bytes_in": 0,
+    "bytes_out": 0,
+    "lines_in": 0,
+    "lines_out": 0,
+}
+
+def load_completed_set(log_path: str) -> set:
+    done = set()
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                name = line.strip()
+                if name and not name.startswith("#"):
+                    done.add(name)
+    return done
+
+def append_completed(log_path: str, file_name: str):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(file_name + "\n")
+        f.flush()
+
+def ensure_output_folder(input_folder: str) -> str:
+    parent = os.path.dirname(os.path.abspath(input_folder))
+    base   = os.path.basename(os.path.abspath(input_folder))
+    outdir = os.path.join(parent, base + "_gz")
+    os.makedirs(outdir, exist_ok=True)
+    return outdir
+
+def compress_one(src_path: str, dst_folder: str) -> dict:
+    """
+    Line-by-line gzip: preserves line boundaries, counts lines, and compresses.
+    Returns dict:
+      { file_name, ok, bytes_in, bytes_out, lines_in, lines_out, blank_input(bool), error(str|None) }
+    """
+    base = os.path.basename(src_path)
+    dst_path = os.path.join(dst_folder, base + ".gz")
+    out = {
+        "file_name": base,
+        "ok": False,
+        "bytes_in": 0,
+        "bytes_out": 0,
+        "lines_in": 0,
+        "lines_out": 0,
+        "blank_input": False,
+        "error": None
+    }
+
+    try:
+        # get input size (best-effort)
+        try:
+            out["bytes_in"] = os.path.getsize(src_path)
+        except Exception:
+            pass
+
+        any_line = False
+        with open(src_path, "r", encoding="utf-8", errors="ignore", buffering=READ_BUF) as fin, \
+             gzip.open(dst_path, "wt", encoding="utf-8", compresslevel=GZIP_LEVEL) as fout:
+
+            for line in fin:
+                any_line = True
+                out["lines_in"] += 1
+                fout.write(line)
+                out["lines_out"] += 1
+
+        if not any_line:
+            out["blank_input"] = True
+
+        # gz size (best-effort)
+        try:
+            out["bytes_out"] = os.path.getsize(dst_path)
+        except Exception:
+            pass
+
+        # quick sanity: open gz and read a byte
+        try:
+            with gzip.open(dst_path, "rt", encoding="utf-8") as t:
+                _ = t.read(1)
+        except Exception as ve:
+            raise RuntimeError(f"post-compress read failed: {ve}")
+
+        out["ok"] = True
+        return out
+
+    except Exception as e:
+        # cleanup partial
+        try:
+            if os.path.exists(dst_path):
+                os.remove(dst_path)
+        except Exception:
+            pass
+        err = f"{base}: {e.__class__.__name__}: {e}\n" + "".join(
+            traceback.format_exception_only(type(e), e)
+        ).strip()
+        out["error"] = err
+        return out
+
+def write_summary(all_txt, pending):
+    ratio = (summary["bytes_in"] / summary["bytes_out"]) if summary["bytes_out"] else 0.0
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write(f"Compress Summary - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Input Folder:  {summary['input_folder']}\n")
+        f.write(f"Output Folder: {summary['output_folder']}\n")
+        f.write(f"Max Workers: {MAX_WORKERS}, GZIP level: {GZIP_LEVEL}\n\n")
+
+        f.write("=== Discovery ===\n")
+        f.write(f"Total .txt found: {len(all_txt)}\n")
+        f.write(f"Pending at start: {len(pending)}\n")
+        f.write(f"Skipped (already in resume log): {len(summary['skipped_files'])}\n\n")
+
+        f.write("=== Progress (this run) ===\n")
+        f.write(f"Files compressed OK: {summary['files_done']}\n")
+        f.write(f"Files error:         {summary['files_error']}\n")
+        f.write(f"Blank input files:   {len(summary['blank_files'])}\n\n")
+
+        f.write("=== Lines ===\n")
+        f.write(f"Total lines read:    {summary['lines_in']:,}\n")
+        f.write(f"Total lines written: {summary['lines_out']:,}\n\n")
+
+        f.write("=== Bytes ===\n")
+        f.write(f"Total input bytes:   {summary['bytes_in']:,}\n")
+        f.write(f"Total output bytes:  {summary['bytes_out']:,}\n")
+        if summary["bytes_out"]:
+            f.write(f"Overall ratio (in/out): {ratio:.2f}x\n")
+        f.write("\n")
+
+        if summary["skipped_files"]:
+            f.write("=== Skipped Files ===\n")
+            for s in summary["skipped_files"]:
+                f.write(f"- {s}\n")
+            f.write("\n")
+
+        if summary["blank_files"]:
+            f.write("=== Blank Input Files (0 lines) ===\n")
+            for s in summary["blank_files"]:
+                f.write(f"- {s}\n")
+            f.write("\n")
+
+        if summary["errors"]:
+            f.write("=== Errors ===\n")
+            for err in summary["errors"]:
+                f.write(f"- {err}\n")
+
+def main():
+    # optional CLI arg to set input folder
+    in_arg = sys.argv[1] if len(sys.argv) > 1 else INPUT_FOLDER
+    if not os.path.isdir(in_arg):
+        print(f"ERROR: INPUT_FOLDER does not exist: {in_arg}", file=sys.stderr)
+        sys.exit(1)
+
+    summary["start_ts"] = time.time()
+    summary["input_folder"] = os.path.abspath(in_arg)
+    out_folder = ensure_output_folder(in_arg)
+    summary["output_folder"] = out_folder
+
+    # discover .txt (non-recursive)
+    all_txt = sorted(
+        os.path.join(in_arg, f)
+        for f in os.listdir(in_arg)
+        if f.endswith(".txt") and os.path.isfile(os.path.join(in_arg, f))
+    )
+    summary["files_found"] = len(all_txt)
+    if not all_txt:
+        print("No .txt files found.")
+        write_summary([], [])
+        return
+
+    # resume
+    done = load_completed_set(RESUME_LOG)
+    pending = [p for p in all_txt if os.path.basename(p) not in done]
+    summary["skipped_files"] = sorted([os.path.basename(p) for p in all_txt if os.path.basename(p) in done])
+    summary["files_pending"] = len(pending)
+
+    # initial summary write
+    write_summary(all_txt, pending)
+
+    if not pending:
+        print("Nothing to do (all already compressed per resume log).")
+        return
+
+    overall = tqdm(total=len(pending), desc="Compressing", unit="file", leave=True)
+    last_summary = time.time()
+
+    try:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futs = {ex.submit(compress_one, p, out_folder): p for p in pending}
+            for fut in as_completed(futs):
+                res = fut.result()
+                base = res["file_name"]
+
+                if res["ok"]:
+                    summary["files_done"] += 1
+                    summary["bytes_in"]  += res["bytes_in"]
+                    summary["bytes_out"] += res["bytes_out"]
+                    summary["lines_in"]  += res["lines_in"]
+                    summary["lines_out"] += res["lines_out"]
+                    if res["blank_input"]:
+                        summary["blank_files"].append(base)
+                    append_completed(RESUME_LOG, base)
+                else:
+                    summary["files_error"] += 1
+                    summary["errors"].append(res["error"])
+
+                overall.update(1)
+
+                if time.time() - last_summary >= SUMMARY_EVERY_SECS:
+                    write_summary(all_txt, pending)
+                    last_summary = time.time()
+
+    finally:
+        overall.close()
+        summary["end_ts"] = time.time()
+        write_summary(all_txt, pending)
+
+if __name__ == "__main__":
+    main()
