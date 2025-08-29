@@ -10,27 +10,28 @@ from functools import lru_cache
 from datetime import datetime
 from tqdm import tqdm
 
-# ====== CONFIGURATION (fully hardcoded) ====== #
-INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs_gz"   # 🔧 Folder with .gz inputs (non-recursive) 
-OUTPUT_FOLDER = "output_regex"                            # Outputs as .gz (same basenames)
-SUMMARY_FILE = "summary_report.txt"                       # Saved in current working dir
-RESUME_LOG   = "resume_files.log"                         # ✅ Checkpoint log in current working dir
-MAX_WORKERS  = 6                                          # Use 6–8
-SUMMARY_EVERY_SECS = 30                                   
-GZIP_LEVEL   = 1                                          # Fastest gzip for logs
+# ====== CONFIGURATION ====== #
+INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs_gz"  # 🔧 Folder with .gz inputs (non-recursive)
+OUTPUT_FOLDER = "output_regex"                           # Outputs as .gz (same basenames)
+SUMMARY_FILE = "summary_report.txt"                      # Saved in current working dir
+RESUME_LOG   = "resume_files.log"                        # ✅ Checkpoint log in current working dir
+MAX_WORKERS  = 6                                         # Use 6–8
+SUMMARY_EVERY_SECS = 30
+GZIP_LEVEL   = 1                                         # Fast gzip for logs
 
 # Long-line EMAIL/UPI handling
 ENABLE_EMAIL_WINDOWING = True
 ENABLE_UPI_WINDOWING   = True
-ENABLE_EMAIL_HARD_SKIP = False    # <-- you asked to NOT skip: keep False
-ENABLE_UPI_HARD_SKIP   = False    # <-- you asked to NOT skip: keep False
+# You asked to NOT skip on very long lines:
+ENABLE_EMAIL_HARD_SKIP = False
+ENABLE_UPI_HARD_SKIP   = False
 
 LONG_LINE_WINDOW = 50_000         # > this: use windowing around '@'
 HARD_SKIP_LEN    = 1_000_000      # >= this: (disabled by flags above)
 EMAIL_WIN_L, EMAIL_WIN_R = 256, 320
 UPI_WIN_L,   UPI_WIN_R   = 256,  64
 MAX_ATS_PER_LINE = 2000
-# ============================================= #
+# =========================== #
 
 # ---------- REGEX PATTERNS ----------
 PII_PATTERNS = {
@@ -41,15 +42,11 @@ PII_PATTERNS = {
     "DL_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{2}\d{2}\d{11}(?![A-Za-z0-9])', re.IGNORECASE),
     "VOTERID_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{3}\d{7}(?![A-Za-z0-9])', re.IGNORECASE),
 
-    # EMAIL: TLD >=2 (e.g., .co, .com, .co.in via preceding domain part). Case-insensitive.
+    # EMAIL: TLD >=2 (e.g., .co, .com, .net, .org, .in, .co.in via the domain part)
     "EMAIL_REGEX": re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.IGNORECASE),
 
-    # UPI: right-lookahead blocks email-like continuations (.com etc.), but allows end or delimiters.
+    # UPI: block email-like continuations (.com etc.); allow EOL or delimiters after PSP.
     # Allowed delimiters after PSP: whitespace, < > [ ] { } ( ) , ; _ -
-    # Examples:
-    #  - "9645828399@abc"            => match (end)
-    #  - "abc@payme>"                => match (delimiter)
-    #  - "abc@google.com"            => NO match ('.' after PSP)
     "UPI_REGEX": re.compile(
         r'[A-Za-z0-9._-]{2,256}@[A-Za-z]{2,64}(?=$|[\s<>\[\]\{\}\(\),;_\-])'
     ),
@@ -87,30 +84,25 @@ PII_PATTERNS = {
 
 # ---------- SUMMARY (aggregated in parent) ----------
 summary = {
-    # discovery & resume
-    "files_found": 0,
-    "skipped_files": [],
-
-    # per-run processing
     "files_scanned": 0,
     "files_success": 0,
     "files_error": 0,
-    "blank_input_files": [],
-    "zero_match_files": [],
-    "errors": [],
+    "blank_input_files": [],      # input had 0 lines
+    "zero_match_files": [],       # had lines but wrote none
+    "errors": [],                 # list of error strings
 
     # counters
-    "total_lines": 0,
-    "output_lines_written": 0,
-    "total_no_match_lines": 0,   # recomputed at write
+    "total_lines": 0,             # input lines scanned
+    "output_lines_written": 0,    # rows written (one per unique (value,type))
+    "total_no_match_lines": 0,    # sum of per-file no_match_lines
     "per_type_counts": Counter({k: 0 for k in PII_PATTERNS}),
-    "total_matches": 0,          # recomputed at write
+    "total_matches": 0,           # sum(per_type_counts)
 
     # long-line telemetry
     "email_windowed_lines": 0,
-    "email_too_long_lines": 0,   # will stay 0 (hard-skip disabled)
+    "email_too_long_lines": 0,    # will remain 0 (hard-skip disabled)
     "upi_windowed_lines": 0,
-    "upi_too_long_lines": 0,     # will stay 0 (hard-skip disabled)
+    "upi_too_long_lines": 0,      # will remain 0 (hard-skip disabled)
 
     # timing/config
     "start_ts": None,
@@ -258,9 +250,9 @@ def process_file(file_path: str) -> dict:
         "input_was_blank": False,
         # long-line telemetry
         "email_windowed_lines": 0,
-        "email_too_long_lines": 0,   # will remain 0 (no hard-skip)
+        "email_too_long_lines": 0,  # stays 0 with hard-skip disabled
         "upi_windowed_lines": 0,
-        "upi_too_long_lines": 0,     # will remain 0 (no hard-skip)
+        "upi_too_long_lines": 0,    # stays 0 with hard-skip disabled
     }
     out_path = os.path.join(OUTPUT_FOLDER, os.path.basename(file_path))  # output .gz
 
@@ -295,7 +287,6 @@ def process_file(file_path: str) -> dict:
                 if upi_mode   == "WINDOWED": local["upi_windowed_lines"]   += 1
 
                 if unique_matches:
-                    # write each unique (value,type) pair once per line
                     for value, pii_type in sorted(unique_matches):
                         f_out.write(f"{log_line} ; {path} ;{value};{pii_type}\n")
                         local["written"] += 1
@@ -339,70 +330,58 @@ def append_completed(log_path: str, file_name: str):
         f.flush()
 
 # ---------- Summary writer ----------
-def write_summary(input_folder: str, all_files=None, pending_files=None, completed_set=None):
+def write_summary():
     summary["end_ts"] = time.time()
     summary["total_matches"] = sum(summary["per_type_counts"].values())
-    summary["total_no_match_lines"] = summary["total_lines"] - summary["output_lines_written"]
 
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
         f.write(f"Summary Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Input Folder: {os.path.abspath(input_folder)}\n")
+        f.write(f"Input Folder: {os.path.abspath(INPUT_FOLDER)}\n")
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
         f.write(f"Max Workers: {summary['max_workers']}\n")
         f.write(f"GZIP Level: {GZIP_LEVEL}\n")
         f.write(f"EMAIL windowing: {ENABLE_EMAIL_WINDOWING}; hard-skip: {ENABLE_EMAIL_HARD_SKIP}\n")
         f.write(f"UPI   windowing: {ENABLE_UPI_WINDOWING}; hard-skip: {ENABLE_UPI_HARD_SKIP}\n\n")
 
-        if all_files is not None and pending_files is not None and completed_set is not None:
-            skipped = sorted([os.path.basename(fp) for fp in all_files if os.path.basename(fp) in completed_set])
-            summary["skipped_files"] = skipped
-            f.write("=== File Discovery ===\n")
-            f.write(f"Total .gz files found: {len(all_files)}\n")
-            f.write(f"Already completed (skipped this run): {len(skipped)}\n")
-            f.write(f"Pending at start of run: {len(pending_files)}\n\n")
+        # ---- Files processed ----
+        f.write("=== Files Processed ===\n")
+        f.write(f"Processed: {summary['files_scanned']}\n")
+        f.write(f"Success:   {summary['files_success']}\n")
+        f.write(f"Errors:    {summary['files_error']}\n")
+        f.write(f"Blank input files: {len(summary['blank_input_files'])}\n")
+        f.write(f"Files with 0 matches: {len(summary['zero_match_files'])}\n\n")
 
-        f.write("=== Processing (this run) ===\n")
-        f.write(f"Files processed: {summary['files_scanned']}\n")
-        f.write(f" - Success: {summary['files_success']}\n")
-        f.write(f" - Errors:  {summary['files_error']}\n")
-        f.write(f" - Blank input files: {len(summary['blank_input_files'])}\n")
-        f.write(f" - Files with 0 matches (had lines): {len(summary['zero_match_files'])}\n\n")
-
+        # ---- Line counts ----
         f.write("=== Line Counts (this run) ===\n")
-        f.write(f"Total Lines Scanned: {summary['total_lines']}\n")
-        f.write(f"Lines Written (unique matches): {summary['output_lines_written']}\n")
-        f.write(f"Lines Removed (no match): {summary['total_no_match_lines']}\n\n")
+        f.write(f"Total lines scanned: {summary['total_lines']}\n")
+        f.write(f"Lines written:       {summary['output_lines_written']}\n")
+        f.write(f"Lines removed:       {summary['total_no_match_lines']}\n\n")
 
+        # ---- PII type counts ----
         f.write("=== PII Type Counts (this run) ===\n")
         for pii_type, count in sorted(summary['per_type_counts'].items()):
             f.write(f"- {pii_type}: {count}\n")
-        f.write("\n")
+        f.write(f"(Sanity: sum(per-type)={summary['total_matches']} vs lines written={summary['output_lines_written']})\n\n")
 
-        f.write("=== Long-line telemetry (EMAIL/UPI) ===\n")
-        f.write(f"Email: windowed lines = {summary['email_windowed_lines']}, too-long-skipped = {summary['email_too_long_lines']}\n")
-        f.write(f"UPI:   windowed lines = {summary['upi_windowed_lines']},   too-long-skipped = {summary['upi_too_long_lines']}\n")
-
-        if summary['skipped_files']:
-            f.write("\n=== Skipped Files (already completed) ===\n")
-            for fname in summary['skipped_files']:
-                f.write(f"- {fname}\n")
-
-        if summary['blank_input_files']:
-            f.write("\n=== Blank Input Files (0 lines) ===\n")
-            for fname in sorted(summary['blank_input_files']):
-                f.write(f"- {fname}\n")
-
+        # ---- Files with 0 matches ----
         if summary['zero_match_files']:
-            f.write("\n=== Files With 0 Matches (had lines) ===\n")
+            f.write("=== Files With 0 Matches ===\n")
             for fname in sorted(summary['zero_match_files']):
                 f.write(f"- {fname}\n")
+            f.write("\n")
 
+        # ---- Blank files ----
+        if summary['blank_input_files']:
+            f.write("=== Blank Input Files (0 lines) ===\n")
+            for fname in sorted(summary['blank_input_files']):
+                f.write(f"- {fname}\n")
+            f.write("\n")
+
+        # ---- Errors ----
         if summary['errors']:
-            f.write("\n=== Errors (this run) ===\n")
+            f.write("=== Errors (this run) ===\n")
             for err in summary['errors']:
                 f.write(f"- {err}\n")
-
-        f.write(f"\nSanity: sum(per-type)={summary['total_matches']}  vs output_lines={summary['output_lines_written']}\n")
 
 # ---------- Main ----------
 def main():
@@ -419,11 +398,10 @@ def main():
         for f in os.listdir(INPUT_FOLDER)
         if f.endswith(".gz") and os.path.isfile(os.path.join(INPUT_FOLDER, f))
     )
-    summary["files_found"] = len(all_files)
 
     if not all_files:
         print("No .gz files found in INPUT_FOLDER.", file=sys.stderr)
-        write_summary(INPUT_FOLDER, [], [], set())
+        write_summary()  # write empty summary shell
         sys.exit(2)
 
     # Resume set: ONLY resume log (do NOT infer from existing outputs)
@@ -432,11 +410,8 @@ def main():
 
     if not pending_files:
         print("All files already processed per resume log. Nothing to do.")
-        write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+        write_summary()
         return
-
-    # Prime summary
-    write_summary(INPUT_FOLDER, all_files, pending_files, completed)
 
     overall_bar = tqdm(total=len(pending_files), desc="Overall", unit="file", leave=True)
     last_summary_write = time.time()
@@ -457,20 +432,21 @@ def main():
                     summary["errors"].append(f"{base}: worker exception: {e}")
                     overall_bar.update(1)
                     if time.time() - last_summary_write >= SUMMARY_EVERY_SECS:
-                        write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+                        write_summary()
                         last_summary_write = time.time()
                     continue
 
                 summary["files_scanned"] += 1
                 summary["total_lines"] += local["lines"]
                 summary["output_lines_written"] += local["written"]
+                summary["total_no_match_lines"] += local["no_match_lines"]  # ✅ true removed-lines count
                 summary["per_type_counts"].update(local["per_type_counts"])
 
                 # long-line telemetry
                 summary["email_windowed_lines"] += local["email_windowed_lines"]
-                summary["email_too_long_lines"] += local["email_too_long_lines"]   # stays 0
+                summary["email_too_long_lines"] += local["email_too_long_lines"]  # stays 0
                 summary["upi_windowed_lines"]   += local["upi_windowed_lines"]
-                summary["upi_too_long_lines"]   += local["upi_too_long_lines"]     # stays 0
+                summary["upi_too_long_lines"]   += local["upi_too_long_lines"]    # stays 0
 
                 if local["input_was_blank"]:
                     summary["blank_input_files"].append(local["file_name"])
@@ -486,13 +462,14 @@ def main():
 
                 overall_bar.update(1)
 
+                # Periodic summary flush
                 if time.time() - last_summary_write >= SUMMARY_EVERY_SECS:
-                    write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+                    write_summary()
                     last_summary_write = time.time()
 
     finally:
         overall_bar.close()
-        write_summary(INPUT_FOLDER, all_files, pending_files, completed)
+        write_summary()
 
 if __name__ == "__main__":
     main()
