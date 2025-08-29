@@ -11,7 +11,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 # ====== CONFIGURATION (fully hardcoded) ====== #
-INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs_gz"   # 🔧 Folder with .gz inputs (non-recursive)
+INPUT_FOLDER = r"C:\Users\manav\Documents\pii_logs_gz"   # 🔧 Folder with .gz inputs (non-recursive) 
 OUTPUT_FOLDER = "output_regex"                            # Outputs as .gz (same basenames)
 SUMMARY_FILE = "summary_report.txt"                       # Saved in current working dir
 RESUME_LOG   = "resume_files.log"                         # ✅ Checkpoint log in current working dir
