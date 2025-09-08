@@ -25,24 +25,35 @@ PII_PATTERNS = {
     "GSTIN_REGEX": re.compile(r'(?<![A-Za-z0-9])\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z](?![A-Za-z0-9])', re.IGNORECASE),
     "DL_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{2}\d{2}\d{11}(?![A-Za-z0-9])', re.IGNORECASE),
     "VOTERID_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{3}\d{7}(?![A-Za-z0-9])', re.IGNORECASE),
+
+    # EMAIL: TLD >=2
     "EMAIL_REGEX": re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.IGNORECASE),
+
+    # UPI: block email-like continuations; allow delimiters after PSP.
     "UPI_REGEX": re.compile(r'[A-Za-z0-9._-]{2,256}@[A-Za-z]{2,64}(?=$|[\s<>\[\]\{\}\(\),;_\-])'),
+
+    # IPv4 strict 0–255
     "IP_REGEX": re.compile(
         r'(?<!\d)'
         r'(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}'
         r'(?:25[0-5]|2[0-4]\d|1?\d?\d)'
         r'(?!\d)'
     ),
+
     "MAC_REGEX": re.compile(r'(?<![A-Fa-f0-9])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![A-Fa-f0-9])'),
+
+    # Card numbers with alnum lookarounds; validated with Luhn.
     "CARD_REGEX": re.compile(
         r'(?<![A-Za-z0-9])('
         r'4\d{12}(?:\d{3})?'                                 # Visa
         r'|5[1-5]\d{14}'                                     # Mastercard (old range)
-        r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'
+        r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'  # Mastercard 2-series
         r'|3[47]\d{13}'                                      # Amex
         r'|60\d{14}|65\d{14}|81\d{14}|508\d\d{12}'           # Other BINs
         r')(?![A-Za-z0-9])'
     ),
+
+    # Coords: decimals required for both lat/lon
     "COORD_REGEX": re.compile(
         r'(?<![A-Za-z0-9])'
         r'([+-]?(?:90\.(?:0+)?|[0-8]?\d\.\d+))'
@@ -135,7 +146,7 @@ def build_keyword_regex(phrase: str) -> re.Pattern:
 
 KEYWORD_REGEXES = {k: [build_keyword_regex(p) for p in v] for k, v in KEYWORD_PHRASES.items()}
 
-# Clean folder names
+# Clean folder names (ALWAYS use these for writing)
 KEYWORD_FOLDER = {
     "ADDRESS_KEYWORD": "address",
     "NAME_KEYWORD": "name",
@@ -238,6 +249,7 @@ def keyword_matches_for_line(line: str):
                 else:
                     found_valid = True
             else:
+                # No key-value form; treat as valid mention
                 found_valid = True
         if found_valid:
             valid_types.add(folder)
@@ -377,11 +389,11 @@ def write_summary(summary):
 
         f.write("\nTotal Output Files Created per PII Type:\n")
         for t in sorted(summary["output_files_per_type"].keys()):
-            f.write(f"  {t}: {summary['output_files_per_type"][t]}\n")
+            f.write(f"  {t}: {summary['output_files_per_type'][t]}\n")
 
         f.write("\nSkipped Keyword Matches (per type):\n")
         for t in sorted(summary["skipped_keywords"].keys()):
-            f.write(f"  {t}: {summary['skipped_keywords"][t]}\n")
+            f.write(f"  {t}: {summary['skipped_keywords'][t]}\n")
 
         if summary["failed_files"]:
             f.write("\nFailed Files:\n")
