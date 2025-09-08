@@ -220,10 +220,13 @@ def should_skip_keyword(ktype: str, value: str) -> bool:
 
     # Account number / Customer ID (all variants)
     if ktype in ("ACCOUNT_NUMBER_KEYWORD", "CUSTOMER_ID_KEYWORD"):
-        # Skip if value STARTS with a mobile number (even if extra text follows)
+        # Explicit mention of "mobile" in the value → skip
+        if "mobile" in v_lower:
+            return True
+        # Value STARTS with a mobile number (even if extra text follows) → skip
         if is_mobile_value_start(v):
             return True
-        # Skip if first 4–5 alnum chars are not purely digits
+        # First 4–5 alnum chars must be all digits; else skip
         al5 = _first5_alnum(v)
         if al5 and not al5.isdigit():
             return True
@@ -232,29 +235,43 @@ def should_skip_keyword(ktype: str, value: str) -> bool:
 
 # ---------- Matching ----------
 def keyword_matches_for_line(line: str):
+    """
+    Decide validity per keyword type like this:
+      - If we saw any key-value occurrences, we only keep the type if at least one value passed checks.
+      - If we saw NO key-value occurrences but did see a bare mention, we keep it.
+      - Skipped counts accumulate only for value-matches that failed checks.
+    """
     valid_types = set()
     skipped = defaultdict(int)
+
     for ktype, regexes in KEYWORD_REGEXES.items():
         folder = KEYWORD_FOLDER[ktype]
-        found_valid = False
+
+        any_value_seen = False
+        any_value_kept = False
+        bare_mention = False
         local_skips = 0
+
         for rx in regexes:
             if not rx.search(line):
                 continue
+
             value = _extract_value_after(rx, line)
             if value is not None:
+                any_value_seen = True
                 if should_skip_keyword(ktype, value):
                     local_skips += 1
-                    continue
                 else:
-                    found_valid = True
+                    any_value_kept = True
             else:
-                # No key-value form; treat as valid mention
-                found_valid = True
-        if found_valid:
+                bare_mention = True
+
+        # validity decision
+        if any_value_kept or (not any_value_seen and bare_mention):
             valid_types.add(folder)
         if local_skips:
             skipped[folder] += local_skips
+
     return valid_types, skipped
 
 def regex_matches_for_line(line: str):
