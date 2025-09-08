@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+import traceback
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+from functools import lru_cache
+from collections import defaultdict
+
+# ============= CONFIG ============= #
+INPUT_FOLDER     = "input_logs"
+OUTPUT_FOLDER    = "output_pii"
+SUMMARY_FILE     = "summary_report.txt"
+MAX_WORKERS      = 6
+LINES_PER_FILE   = 10000
+# ================================== #
+
+# ---------- REGEX PATTERNS ----------
+PII_PATTERNS = {
+    "MOBILE_REGEX": re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])'),
+    "AADHAAR_REGEX": re.compile(r'(?<![A-Za-z0-9])(\d{12})(?![A-Za-z0-9])'),
+    "PAN_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Za-z0-9])', re.IGNORECASE),
+    "GSTIN_REGEX": re.compile(r'(?<![A-Za-z0-9])\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z](?![A-Za-z0-9])', re.IGNORECASE),
+    "DL_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{2}\d{2}\d{11}(?![A-Za-z0-9])', re.IGNORECASE),
+    "VOTERID_REGEX": re.compile(r'(?<![A-Za-z0-9])[A-Z]{3}\d{7}(?![A-Za-z0-9])', re.IGNORECASE),
+    "EMAIL_REGEX": re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', re.IGNORECASE),
+    "UPI_REGEX": re.compile(r'[A-Za-z0-9._-]{2,256}@[A-Za-z]{2,64}(?=$|[\s<>\[\]\{\}\(\),;_\-])'),
+    "IP_REGEX": re.compile(
+        r'(?<!\d)'
+        r'(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}'
+        r'(?:25[0-5]|2[0-4]\d|1?\d?\d)'
+        r'(?!\d)'
+    ),
+    "MAC_REGEX": re.compile(r'(?<![A-Fa-f0-9])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![A-Fa-f0-9])'),
+    "CARD_REGEX": re.compile(
+        r'(?<![A-Za-z0-9])('
+        r'4\d{12}(?:\d{3})?'                                 # Visa
+        r'|5[1-5]\d{14}'                                     # Mastercard (old range)
+        r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'
+        r'|3[47]\d{13}'                                      # Amex
+        r'|60\d{14}|65\d{14}|81\d{14}|508\d\d{12}'           # Other BINs
+        r')(?![A-Za-z0-9])'
+    ),
+    "COORD_REGEX": re.compile(
+        r'(?<![A-Za-z0-9])'
+        r'([+-]?(?:90\.(?:0+)?|[0-8]?\d\.\d+))'
+        r'\s*,\s*'
+        r'([+-]?(?:180\.(?:0+)?|1[0-7]\d\.\d+|[0-9]?\d\.\d+))'
+        r'(?![A-Za-z0-9])'
+    ),
+}
+
+# ---------- Aadhaar Verhoeff ----------
+@lru_cache(maxsize=10000)
+def is_valid_aadhaar(number: str) -> bool:
+    if len(number) != 12 or not number.isdigit():
+        return False
+    mul = [
+        [0,1,2,3,4,5,6,7,8,9],
+        [1,2,3,4,0,6,7,8,9,5],
+        [2,3,4,0,1,7,8,9,5,6],
+        [3,4,0,1,2,8,9,5,6,7],
+        [4,0,1,2,3,9,5,6,7,8],
+        [5,9,8,7,6,0,4,3,2,1],
+        [6,5,9,8,7,1,0,4,3,2],
+        [7,6,5,9,8,2,1,0,4,3],
+        [8,7,6,5,9,3,2,1,0,4],
+        [9,8,7,6,5,4,3,2,1,0]
+    ]
+    perm = [
+        [0,1,2,3,4,5,6,7,8,9],
+        [1,5,7,6,2,8,3,0,9,4],
+        [5,8,0,3,7,9,6,1,4,2],
+        [8,9,1,6,0,4,3,5,2,7],
+        [9,4,5,3,1,2,6,8,7,0],
+        [4,2,8,6,5,7,3,9,0,1],
+        [2,7,9,3,8,0,6,4,1,5],
+        [7,0,4,6,9,1,3,2,5,8]
+    ]
+    inv = [0,4,3,2,1,5,6,7,8,9]
+    c = 0
+    for i, ch in enumerate(reversed(number)):
+        c = mul[c][perm[i % 8][int(ch)]]
+    return inv[c] == 0
+
+# ---------- Card Luhn ----------
+def _luhn_valid(num: str) -> bool:
+    s, alt = 0, False
+    for ch in reversed(num):
+        if not ch.isdigit():
+            return False
+        n = ord(ch) - 48
+        if alt:
+            n *= 2
+            if n > 9:
+                n -= 9
+        s += n
+        alt = not alt
+    return (s % 10) == 0
+
+# ---------- KEYWORDS ----------
+KEYWORD_PHRASES = {
+    "ADDRESS_KEYWORD": ["address","full address","complete address","residential address","permanent address","addr"],
+    "NAME_KEYWORD": ["name","nam"],
+    "DOB_KEYWORD": ["date of birth","dob","birthdate","born on"],
+    "ACCOUNT_NUMBER_KEYWORD": ["account number","acc number","bank account","account no","a/c no","accountnumber"],
+    "CUSTOMER_ID_KEYWORD": ["customer id","cust id","customer number","cust"],
+    "SENSITIVE_HINTS_KEYWORD": ["national id","identity card","proof of identity","document number"],
+    "INSURANCE_POLICY_KEYWORD": ["insurance number","policy number","insurance id","ins id"],
+}
+
+def build_keyword_regex(phrase):
+    # allow spaces, hyphens, underscores inside phrase
+    pat = re.sub(r"\s+", r"[\\s_-]+", re.escape(phrase))
+    return re.compile(rf"(?<![A-Za-z0-9]){pat}(?![A-Za-z0-9])", re.IGNORECASE)
+
+KEYWORD_REGEXES = {k:[build_keyword_regex(p) for p in v] for k,v in KEYWORD_PHRASES.items()}
+
+# ---------- Processing ----------
+def process_line(line, path, summary):
+    matches = defaultdict(bool)
+    skipped_keywords = defaultdict(int)
+
+    # Keyword matches
+    for ktype, regexes in KEYWORD_REGEXES.items():
+        for rx in regexes:
+            if rx.search(line):
+                # Check for null/empty cases
+                if re.search(rf"{rx.pattern}\s*[:=\-]\s*(null\b|,|\s*$)", line, re.IGNORECASE):
+                    skipped_keywords[ktype] += 1
+                    continue
+                matches[("keyword", ktype)] = True
+
+    # Regex matches
+    for rtype, rx in PII_PATTERNS.items():
+        for m in rx.finditer(line):
+            val = m.group(0)
+            if rtype == "AADHAAR_REGEX" and not is_valid_aadhaar(val):
+                continue
+            if rtype == "CARD_REGEX" and not _luhn_valid(val):
+                continue
+            matches[("regex", rtype)] = True
+
+    return matches, skipped_keywords
+
+def process_file(filepath, summary):
+    results = []
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line=line.rstrip("\n")
+                if not line.strip(): continue
+                log,path = line, filepath
+                matches, skipped = process_line(log, path, summary)
+                if not matches:
+                    summary["lines_dropped"] += 1
+                    for k,v in skipped.items():
+                        summary["skipped_keywords"][k]+=v
+                    continue
+                for (mtype,ptype) in matches.keys():
+                    results.append((mtype,ptype,log))
+                for k,v in skipped.items():
+                    summary["skipped_keywords"][k]+=v
+                summary["lines_scanned"]+=1
+    except Exception as e:
+        summary["errors"].append(f"{filepath}: {e}")
+    return results
+
+def write_results(results, summary):
+    outmap = {}
+    for mtype,ptype,line in results:
+        base = Path(OUTPUT_FOLDER) / ( "keyword_matches" if mtype=="keyword" else "regex_matches") / ptype.lower()
+        os.makedirs(base, exist_ok=True)
+        count = summary["per_type_counts"][ptype]+1
+        fidx = (count-1)//LINES_PER_FILE + 1
+        fname = f"{ptype.lower()}_{fidx:04d}.txt"
+        outpath = base/fname
+        if outpath not in outmap:
+            outmap[outpath]=open(outpath,"a",encoding="utf-8")
+        outmap[outpath].write(line+"\n")
+        summary["per_type_counts"][ptype]+=1
+    for f in outmap.values(): f.close()
+
+def write_summary(summary):
+    with open(SUMMARY_FILE,"w",encoding="utf-8") as f:
+        f.write("Summary Report\n")
+        f.write(f"Total Files Scanned: {summary['files_scanned']}\n")
+        f.write(f"Total Lines Scanned: {summary['lines_scanned']}\n")
+        f.write(f"Total Lines Dropped: {summary['lines_dropped']}\n\n")
+        f.write("Per-Type Counts:\n")
+        for k,v in summary["per_type_counts"].items():
+            f.write(f"  {k}: {v}\n")
+        f.write("\nSkipped Keyword Matches:\n")
+        for k,v in summary["skipped_keywords"].items():
+            f.write(f"  {k}: {v}\n")
+        f.write("\nErrors:\n")
+        for e in summary["errors"]:
+            f.write(f"  {e}\n")
+
+def main():
+    txtfiles = list(Path(INPUT_FOLDER).rglob("*.txt"))
+    summary = {
+        "files_scanned": len(txtfiles),
+        "lines_scanned": 0,
+        "lines_dropped": 0,
+        "per_type_counts": defaultdict(int),
+        "skipped_keywords": defaultdict(int),
+        "errors": []
+    }
+    all_results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(process_file,f,summary):f for f in txtfiles}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Files"):
+            res=fut.result()
+            if res: all_results.extend(res)
+    write_results(all_results, summary)
+    write_summary(summary)
+
+if __name__=="__main__":
+    main()
