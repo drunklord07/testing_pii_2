@@ -38,7 +38,7 @@ PII_PATTERNS = {
         r'(?<![A-Za-z0-9])('
         r'4\d{12}(?:\d{3})?'                                 # Visa
         r'|5[1-5]\d{14}'                                     # Mastercard (old range)
-        r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'  # Mastercard 2-series
+        r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'
         r'|3[47]\d{13}'                                      # Amex
         r'|60\d{14}|65\d{14}|81\d{14}|508\d\d{12}'           # Other BINs
         r')(?![A-Za-z0-9])'
@@ -134,7 +134,7 @@ def build_keyword_regex(phrase: str) -> re.Pattern:
 
 KEYWORD_REGEXES = {k: [build_keyword_regex(p) for p in v] for k, v in KEYWORD_PHRASES.items()}
 
-# Folder name mapping (clean, user-facing)
+# Clean folder names (NEVER write with internal keys)
 KEYWORD_FOLDER = {
     "ADDRESS_KEYWORD": "address",
     "NAME_KEYWORD": "name",
@@ -178,29 +178,27 @@ def should_skip_keyword(ktype: str, value: str) -> bool:
     # Global skip rules
     if v == "" or v_lower == "null":
         return True
-    if re.fullmatch(r"\*+", v):  # masked ****
+    if re.fullmatch(r"\*+", v):            # masked "****"
         return True
-    if v_lower in ("y", "n"):
+    if v_lower in ("y", "n"):               # flag-only values
         return True
 
     # Address special case
     if ktype == "ADDRESS_KEYWORD" and v_lower == "ip-address":
         return True
 
-    # Account number / Customer ID rules (apply to all variants)
+    # Account number / Customer ID (all variants)
     if ktype in ("ACCOUNT_NUMBER_KEYWORD", "CUSTOMER_ID_KEYWORD"):
-        # skip if value is a mobile number
-        if is_mobile_value(v):
+        if is_mobile_value(v):              # followed by a mobile number
             return True
-        # skip if first 4–5 alnum chars are not purely digits
-        al5 = _first5_alnum(v)
-        if al5 and not al5.isdigit():
+        al5 = _first5_alnum(v)             # first 4–5 alnum chars
+        if al5 and not al5.isdigit():      # alphanumeric -> skip
             return True
 
     return False
 
 def keyword_matches_for_line(line: str):
-    """Return a tuple (valid_types_set, skipped_counts_dict) for keyword types."""
+    """Return (valid_keyword_folders_set, skipped_counts_dict_per_folder)."""
     valid_types = set()
     skipped = defaultdict(int)
 
@@ -215,14 +213,14 @@ def keyword_matches_for_line(line: str):
 
             value = _extract_value_after(rx, line)
             if value is not None:
-                # We have a key-value form; apply skip rules
+                # Key-value form: apply skip rules
                 if should_skip_keyword(ktype, value):
                     local_skips += 1
                     continue
                 else:
                     found_valid = True
             else:
-                # No separator/value found; treat as a valid mention of the keyword phrase
+                # No separator/value: treat as a valid mention
                 found_valid = True
 
         if found_valid:
@@ -233,7 +231,7 @@ def keyword_matches_for_line(line: str):
     return valid_types, skipped
 
 def regex_matches_for_line(line: str):
-    """Return a set of regex types (folder names) that matched."""
+    """Return a set of regex folders that matched."""
     types = set()
     for rtype, rx in PII_PATTERNS.items():
         for m in rx.finditer(line):
@@ -242,19 +240,19 @@ def regex_matches_for_line(line: str):
                 continue
             if rtype == "CARD_REGEX" and not _luhn_valid(val):
                 continue
-            types.add(REGEX_FOLDER[rtype])
-            break  # one per type is enough for this line
+            types.add(REGEX_FOLDER[rtype])  # ALWAYS use clean folder name
+            break  # one per type per line
     return types
 
-# ---------- Writer manager (streaming, split by 10k) ----------
+# ---------- Writer (split by 10k) ----------
 class WriterManager:
     def __init__(self, base_out: Path, lines_per_file: int):
         self.base_out = base_out
         self.lines_per_file = lines_per_file
         self.handles = {}  # (kind, folder) -> (fh, current_count_in_this_file)
         self.file_index = defaultdict(int)  # (kind, folder) -> idx
-        self.total_lines_by_type = defaultdict(int)  # folder -> total lines written
-        self.files_created_by_type = defaultdict(int)  # folder -> number of files created
+        self.total_lines_by_type = defaultdict(int)   # folder -> lines written
+        self.files_created_by_type = defaultdict(int) # folder -> num files created
 
     def _open_handle(self, kind: str, folder: str):
         root = "keyword_matches" if kind == "keyword" else "regex_matches"
@@ -268,8 +266,6 @@ class WriterManager:
         fpath = out_dir / fname
         fh = open(fpath, "a", encoding="utf-8")
         self.handles[(kind, folder)] = (fh, 0)
-        # Count file creation only the first time the index is used
-        # (subsequent rolls increment too)
         if self.files_created_by_type[folder] < idx:
             self.files_created_by_type[folder] = idx
 
@@ -281,7 +277,6 @@ class WriterManager:
 
         fh, cur = self.handles[key]
         if cur >= self.lines_per_file:
-            # roll to next file
             fh.close()
             self.file_index[key] += 1
             self._open_handle(kind, folder)
@@ -316,14 +311,13 @@ def process_file(file_path: Path):
                     continue
                 local["lines_total"] += 1
 
-                # Apply matching
+                # Matchers
                 kw_types, kw_skips = keyword_matches_for_line(line)
                 rx_types = regex_matches_for_line(line)
 
                 for k, v in kw_skips.items():
                     local["skipped_keywords"][k] += v
 
-                # dedup per-kind: one line per type
                 wrote_any = False
                 for folder in kw_types:
                     local["results"].append(("keyword", folder, line))
@@ -398,7 +392,6 @@ def main():
         futures = {ex.submit(process_file, p): p for p in files}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Files"):
             result = fut.result()
-            # Merge per-file stats
             summary["lines_scanned"] += result["lines_total"]
             summary["lines_dropped"] += result["lines_dropped"]
             for k, v in result["skipped_keywords"].items():
@@ -409,14 +402,13 @@ def main():
             if result["errors"]:
                 summary["errors"].extend(result["errors"])
 
-            # Stream writes; update per-type counts
+            # Stream writes using ONLY clean folder names
             for kind, folder, line in result["results"]:
                 writer.write(kind, folder, line)
                 summary["per_type_counts"][folder] += 1
 
-    # finalize writer & compute file counts
     writer.close()
-    for folder, nlines in writer.total_lines_by_type.items():
+    for folder, _ in writer.total_lines_by_type.items():
         summary["output_files_per_type"][folder] = writer.files_created_by_type[folder]
 
     write_summary(summary)
