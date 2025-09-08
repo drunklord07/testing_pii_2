@@ -102,13 +102,29 @@ def _luhn_valid(num: str) -> bool:
 
 # ---------- KEYWORDS ----------
 KEYWORD_PHRASES = {
-    "ADDRESS_KEYWORD": ["address","full address","complete address","residential address","permanent address","addr"],
-    "NAME_KEYWORD": ["name","nam"],
-    "DOB_KEYWORD": ["date of birth","dob","birthdate","born on"],
-    "ACCOUNT_NUMBER_KEYWORD": ["account number","acc number","bank account","account no","a/c no","accountnumber"],
-    "CUSTOMER_ID_KEYWORD": ["customer id","cust id","customer number","cust"],
-    "SENSITIVE_HINTS_KEYWORD": ["national id","identity card","proof of identity","document number"],
-    "INSURANCE_POLICY_KEYWORD": ["insurance number","policy number","insurance id","ins id"],
+    "ADDRESS_KEYWORD": [
+        "address","full address","complete address",
+        "residential address","permanent address","addr"
+    ],
+    "NAME_KEYWORD": [
+        "name","nam","fathername","mothername","custname"
+    ],
+    "DOB_KEYWORD": [
+        "date of birth","dob","birthdate","born on","custDob"
+    ],
+    "ACCOUNT_NUMBER_KEYWORD": [
+        "account number","acc number","bank account",
+        "account no","a/c no","accountnumber"
+    ],
+    "CUSTOMER_ID_KEYWORD": [
+        "customer id","cust id","customer number","cust"
+    ],
+    "SENSITIVE_HINTS_KEYWORD": [
+        "national id","identity card","proof of identity","document number"
+    ],
+    "INSURANCE_POLICY_KEYWORD": [
+        "insurance number","policy number","insurance id","ins id"
+    ],
 }
 
 def build_keyword_regex(phrase):
@@ -117,6 +133,30 @@ def build_keyword_regex(phrase):
     return re.compile(rf"(?<![A-Za-z0-9]){pat}(?![A-Za-z0-9])", re.IGNORECASE)
 
 KEYWORD_REGEXES = {k:[build_keyword_regex(p) for p in v] for k,v in KEYWORD_PHRASES.items()}
+
+# ---------- Helpers ----------
+def is_mobile_value(val: str) -> bool:
+    return bool(PII_PATTERNS["MOBILE_REGEX"].fullmatch(val.strip()))
+
+def should_skip_keyword(ktype, value: str) -> bool:
+    v = value.strip().strip(",").lower()
+
+    # global skip rules
+    if v == "" or v == "null" or v == "****" or v in ("y","n"):
+        return True
+    # address special case
+    if ktype == "ADDRESS_KEYWORD" and v == "ip-address":
+        return True
+    # account/customer id rules
+    if ktype in ("ACCOUNT_NUMBER_KEYWORD","CUSTOMER_ID_KEYWORD"):
+        # skip if value is mobile
+        if is_mobile_value(value):
+            return True
+        # skip if first 4-5 chars are alphanumeric (not purely digits)
+        check = v[:5]
+        if not check.isdigit() and any(c.isalpha() for c in check):
+            return True
+    return False
 
 # ---------- Processing ----------
 def process_line(line, path, summary):
@@ -127,10 +167,13 @@ def process_line(line, path, summary):
     for ktype, regexes in KEYWORD_REGEXES.items():
         for rx in regexes:
             if rx.search(line):
-                # Check for null/empty cases
-                if re.search(rf"{rx.pattern}\s*[:=\-]\s*(null\b|,|\s*$)", line, re.IGNORECASE):
-                    skipped_keywords[ktype] += 1
-                    continue
+                # extract value after separator if present
+                m = re.search(rf"{rx.pattern}\s*[:=\-]\s*([^,;\s]+)", line, re.IGNORECASE)
+                if m:
+                    val = m.group(1)
+                    if should_skip_keyword(ktype, val):
+                        skipped_keywords[ktype] += 1
+                        continue
                 matches[("keyword", ktype)] = True
 
     # Regex matches
