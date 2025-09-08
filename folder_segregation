@@ -117,7 +117,8 @@ KEYWORD_PHRASES = {
         "account no","a/c no","accountnumber"
     ],
     "CUSTOMER_ID_KEYWORD": [
-        "customer id","cust id","customer number","cust"
+        "customer id","cust id","customer number","cust",
+        "customerid","custid"  # concatenated forms seen in logs
     ],
     "SENSITIVE_HINTS_KEYWORD": [
         "national id","identity card","proof of identity","document number"
@@ -161,36 +162,64 @@ REGEX_FOLDER = {
 KEYWORD_FOLDERS_SET = set(KEYWORD_FOLDER.values())
 REGEX_FOLDERS_SET = set(REGEX_FOLDER.values())
 
-# ---------- Helpers ----------
+# ---------- Helpers (patched) ----------
+def _strip_wrappers(val: str) -> str:
+    v = val.strip()
+    # strip layers of matching quotes/brackets/parens/braces/angles
+    wrappers = [('"','"'), ("'", "'"), ('[',']'), ('(',')'), ('{','}'), ('<','>')]
+    changed = True
+    while changed and len(v) >= 2:
+        changed = False
+        for L, R in wrappers:
+            if v.startswith(L) and v.endswith(R):
+                v = v[1:-1].strip()
+                changed = True
+    return v
+
+# Mobile token AT START (accept optional leading '+', optional spaces/hyphens after 91)
+_MOBILE_AT_START = re.compile(r'^(?:\+?91[\s-]*)?[6-9]\d{9}(?!\d)')
+
+def is_mobile_value_start(val: str) -> bool:
+    return bool(_MOBILE_AT_START.match(_strip_wrappers(val)))
+
+def _first5_alnum(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", _strip_wrappers(value))[:5]
+
 def _extract_value_after(phrase_regex: re.Pattern, line: str) -> str | None:
+    # Capture value after separator up to comma/semicolon/EOL (allow spaces inside value)
     m = re.search(rf"{phrase_regex.pattern}\s*[:=\-]\s*([^;,]*)", line, re.IGNORECASE)
     return m.group(1) if m else None
 
-def _first5_alnum(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", value)[:5]
-
-def is_mobile_value(val: str) -> bool:
-    return bool(PII_PATTERNS["MOBILE_REGEX"].fullmatch(val.strip()))
-
 def should_skip_keyword(ktype: str, value: str) -> bool:
-    v = value.strip().strip(",").strip().strip('"').strip("'")
+    v_raw = value.strip().strip(",")
+    v = _strip_wrappers(v_raw)
     v_lower = v.lower()
+
+    # Global skip rules
     if v == "" or v_lower == "null":
         return True
-    if re.fullmatch(r"\*+", v):
+    if re.fullmatch(r"\*+", v):            # masked "****"
         return True
-    if v_lower in ("y", "n"):
+    if v_lower in ("y", "n"):               # flag-only
         return True
+
+    # Address special case
     if ktype == "ADDRESS_KEYWORD" and v_lower == "ip-address":
         return True
+
+    # Account number / Customer ID (all variants)
     if ktype in ("ACCOUNT_NUMBER_KEYWORD", "CUSTOMER_ID_KEYWORD"):
-        if is_mobile_value(v):
+        # Skip if value STARTS with a mobile number (even if extra text follows)
+        if is_mobile_value_start(v):
             return True
+        # Skip if first 4–5 alnum chars are not purely digits
         al5 = _first5_alnum(v)
         if al5 and not al5.isdigit():
             return True
+
     return False
 
+# ---------- Matching ----------
 def keyword_matches_for_line(line: str):
     valid_types = set()
     skipped = defaultdict(int)
@@ -333,7 +362,6 @@ def write_summary(summary):
         f.write(f"Input Folder: {INPUT_FOLDER}\n")
         f.write(f"Output Folder: {OUTPUT_FOLDER}\n\n")
 
-        # Your new totals
         f.write(f"Total Lines Written: {total_lines_written}\n")
         f.write(f"Total Input Files Scanned: {summary['files_scanned']}\n")
         f.write(f"Total Files Written: {total_files_written}\n")
@@ -349,11 +377,11 @@ def write_summary(summary):
 
         f.write("\nTotal Output Files Created per PII Type:\n")
         for t in sorted(summary["output_files_per_type"].keys()):
-            f.write(f"  {t}: {summary['output_files_per_type'][t]}\n")
+            f.write(f"  {t}: {summary['output_files_per_type"][t]}\n")
 
         f.write("\nSkipped Keyword Matches (per type):\n")
         for t in sorted(summary["skipped_keywords"].keys()):
-            f.write(f"  {t}: {summary['skipped_keywords'][t]}\n")
+            f.write(f"  {t}: {summary['skipped_keywords"][t]}\n")
 
         if summary["failed_files"]:
             f.write("\nFailed Files:\n")
