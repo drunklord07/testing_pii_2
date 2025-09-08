@@ -173,10 +173,9 @@ REGEX_FOLDER = {
 KEYWORD_FOLDERS_SET = set(KEYWORD_FOLDER.values())
 REGEX_FOLDERS_SET = set(REGEX_FOLDER.values())
 
-# ---------- Helpers (patched) ----------
+# ---------- Helpers ----------
 def _strip_wrappers(val: str) -> str:
     v = val.strip()
-    # strip layers of matching quotes/brackets/parens/braces/angles
     wrappers = [('"','"'), ("'", "'"), ('[',']'), ('(',')'), ('{','}'), ('<','>')]
     changed = True
     while changed and len(v) >= 2:
@@ -196,9 +195,15 @@ def is_mobile_value_start(val: str) -> bool:
 def _first5_alnum(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", _strip_wrappers(value))[:5]
 
+# --------- FIXED extractor: allow optional quote between keyword and separator
 def _extract_value_after(phrase_regex: re.Pattern, line: str) -> str | None:
-    # Capture value after separator up to comma/semicolon/EOL (allow spaces inside value)
-    m = re.search(rf"{phrase_regex.pattern}\s*[:=\-]\s*([^;,]*)", line, re.IGNORECASE)
+    # Support JSON-like keys with closing quote before ':' (e.g., "customerId": "123")
+    # Also support plaintext: customerid: 123  |  customerid = 123  |  customerid-123
+    m = re.search(
+        rf"{phrase_regex.pattern}\s*['\"]?\s*[:=\-]\s*([^;,]*)",
+        line,
+        re.IGNORECASE
+    )
     return m.group(1) if m else None
 
 def should_skip_keyword(ktype: str, value: str) -> bool:
@@ -220,13 +225,10 @@ def should_skip_keyword(ktype: str, value: str) -> bool:
 
     # Account number / Customer ID (all variants)
     if ktype in ("ACCOUNT_NUMBER_KEYWORD", "CUSTOMER_ID_KEYWORD"):
-        # Explicit mention of "mobile" in the value → skip
         if "mobile" in v_lower:
             return True
-        # Value STARTS with a mobile number (even if extra text follows) → skip
         if is_mobile_value_start(v):
             return True
-        # First 4–5 alnum chars must be all digits; else skip
         al5 = _first5_alnum(v)
         if al5 and not al5.isdigit():
             return True
@@ -236,10 +238,10 @@ def should_skip_keyword(ktype: str, value: str) -> bool:
 # ---------- Matching ----------
 def keyword_matches_for_line(line: str):
     """
-    Decide validity per keyword type like this:
-      - If we saw any key-value occurrences, we only keep the type if at least one value passed checks.
-      - If we saw NO key-value occurrences but did see a bare mention, we keep it.
-      - Skipped counts accumulate only for value-matches that failed checks.
+    Valid if:
+      - at least one key-value occurrence passed checks, OR
+      - no key-value occurrences but a bare mention exists.
+    Bare mentions cannot override skipped value-matches.
     """
     valid_types = set()
     skipped = defaultdict(int)
@@ -266,7 +268,6 @@ def keyword_matches_for_line(line: str):
             else:
                 bare_mention = True
 
-        # validity decision
         if any_value_kept or (not any_value_seen and bare_mention):
             valid_types.add(folder)
         if local_skips:
@@ -410,7 +411,7 @@ def write_summary(summary):
 
         f.write("\nSkipped Keyword Matches (per type):\n")
         for t in sorted(summary["skipped_keywords"].keys()):
-            f.write(f"  {t}: {summary['skipped_keywords'][t]}\n")
+            f.write(f"  {t}: {summary['skipped_keywords"][t]}\n")
 
         if summary["failed_files"]:
             f.write("\nFailed Files:\n")
@@ -438,7 +439,6 @@ def main():
         "skipped_keywords": defaultdict(int),
         "failed_files": [],
         "errors": [],
-        # sets for summary splits
         "keyword_folders_set": KEYWORD_FOLDERS_SET,
         "regex_folders_set": REGEX_FOLDERS_SET,
     }
