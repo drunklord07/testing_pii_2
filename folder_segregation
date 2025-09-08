@@ -134,7 +134,7 @@ def build_keyword_regex(phrase: str) -> re.Pattern:
 
 KEYWORD_REGEXES = {k: [build_keyword_regex(p) for p in v] for k, v in KEYWORD_PHRASES.items()}
 
-# Clean folder names (NEVER write with internal keys)
+# Clean folder names
 KEYWORD_FOLDER = {
     "ADDRESS_KEYWORD": "address",
     "NAME_KEYWORD": "name",
@@ -158,10 +158,11 @@ REGEX_FOLDER = {
     "CARD_REGEX": "card",
     "COORD_REGEX": "coord",
 }
+KEYWORD_FOLDERS_SET = set(KEYWORD_FOLDER.values())
+REGEX_FOLDERS_SET = set(REGEX_FOLDER.values())
 
 # ---------- Helpers ----------
 def _extract_value_after(phrase_regex: re.Pattern, line: str) -> str | None:
-    # Capture value after separator up to comma/semicolon/EOL (allow spaces inside value)
     m = re.search(rf"{phrase_regex.pattern}\s*[:=\-]\s*([^;,]*)", line, re.IGNORECASE)
     return m.group(1) if m else None
 
@@ -174,64 +175,48 @@ def is_mobile_value(val: str) -> bool:
 def should_skip_keyword(ktype: str, value: str) -> bool:
     v = value.strip().strip(",").strip().strip('"').strip("'")
     v_lower = v.lower()
-
-    # Global skip rules
     if v == "" or v_lower == "null":
         return True
-    if re.fullmatch(r"\*+", v):            # masked "****"
+    if re.fullmatch(r"\*+", v):
         return True
-    if v_lower in ("y", "n"):               # flag-only values
+    if v_lower in ("y", "n"):
         return True
-
-    # Address special case
     if ktype == "ADDRESS_KEYWORD" and v_lower == "ip-address":
         return True
-
-    # Account number / Customer ID (all variants)
     if ktype in ("ACCOUNT_NUMBER_KEYWORD", "CUSTOMER_ID_KEYWORD"):
-        if is_mobile_value(v):              # followed by a mobile number
+        if is_mobile_value(v):
             return True
-        al5 = _first5_alnum(v)             # first 4–5 alnum chars
-        if al5 and not al5.isdigit():      # alphanumeric -> skip
+        al5 = _first5_alnum(v)
+        if al5 and not al5.isdigit():
             return True
-
     return False
 
 def keyword_matches_for_line(line: str):
-    """Return (valid_keyword_folders_set, skipped_counts_dict_per_folder)."""
     valid_types = set()
     skipped = defaultdict(int)
-
     for ktype, regexes in KEYWORD_REGEXES.items():
         folder = KEYWORD_FOLDER[ktype]
         found_valid = False
         local_skips = 0
-
         for rx in regexes:
             if not rx.search(line):
                 continue
-
             value = _extract_value_after(rx, line)
             if value is not None:
-                # Key-value form: apply skip rules
                 if should_skip_keyword(ktype, value):
                     local_skips += 1
                     continue
                 else:
                     found_valid = True
             else:
-                # No separator/value: treat as a valid mention
                 found_valid = True
-
         if found_valid:
             valid_types.add(folder)
         if local_skips:
             skipped[folder] += local_skips
-
     return valid_types, skipped
 
 def regex_matches_for_line(line: str):
-    """Return a set of regex folders that matched."""
     types = set()
     for rtype, rx in PII_PATTERNS.items():
         for m in rx.finditer(line):
@@ -240,8 +225,8 @@ def regex_matches_for_line(line: str):
                 continue
             if rtype == "CARD_REGEX" and not _luhn_valid(val):
                 continue
-            types.add(REGEX_FOLDER[rtype])  # ALWAYS use clean folder name
-            break  # one per type per line
+            types.add(REGEX_FOLDER[rtype])
+            break
     return types
 
 # ---------- Writer (split by 10k) ----------
@@ -249,7 +234,7 @@ class WriterManager:
     def __init__(self, base_out: Path, lines_per_file: int):
         self.base_out = base_out
         self.lines_per_file = lines_per_file
-        self.handles = {}  # (kind, folder) -> (fh, current_count_in_this_file)
+        self.handles = {}  # (kind, folder) -> (fh, current_count)
         self.file_index = defaultdict(int)  # (kind, folder) -> idx
         self.total_lines_by_type = defaultdict(int)   # folder -> lines written
         self.files_created_by_type = defaultdict(int) # folder -> num files created
@@ -258,7 +243,6 @@ class WriterManager:
         root = "keyword_matches" if kind == "keyword" else "regex_matches"
         out_dir = self.base_out / root / folder
         out_dir.mkdir(parents=True, exist_ok=True)
-
         idx = self.file_index[(kind, folder)]
         if idx == 0:
             idx = 1
@@ -274,14 +258,12 @@ class WriterManager:
         if key not in self.handles:
             self.file_index[key] = max(1, self.file_index[key])
             self._open_handle(kind, folder)
-
         fh, cur = self.handles[key]
         if cur >= self.lines_per_file:
             fh.close()
             self.file_index[key] += 1
             self._open_handle(kind, folder)
             fh, cur = self.handles[key]
-
         fh.write(line + "\n")
         self.handles[key] = (fh, cur + 1)
         self.total_lines_by_type[folder] += 1
@@ -298,7 +280,7 @@ def process_file(file_path: Path):
     local = {
         "lines_total": 0,
         "lines_dropped": 0,
-        "skipped_keywords": defaultdict(int),  # per keyword folder
+        "skipped_keywords": defaultdict(int),
         "results": [],  # list[(kind, folder, line)]
         "failed": None,
         "errors": [],
@@ -311,10 +293,8 @@ def process_file(file_path: Path):
                     continue
                 local["lines_total"] += 1
 
-                # Matchers
                 kw_types, kw_skips = keyword_matches_for_line(line)
                 rx_types = regex_matches_for_line(line)
-
                 for k, v in kw_skips.items():
                     local["skipped_keywords"][k] += v
 
@@ -337,12 +317,29 @@ def process_file(file_path: Path):
 
 # ---------- Summary ----------
 def write_summary(summary):
+    total_lines_written = sum(summary["per_type_counts"].values())
+    total_files_written = sum(summary["output_files_per_type"].values())
+    total_files_written_keyword = sum(
+        count for folder, count in summary["output_files_per_type"].items()
+        if folder in summary["keyword_folders_set"]
+    )
+    total_files_written_regex = sum(
+        count for folder, count in summary["output_files_per_type"].items()
+        if folder in summary["regex_folders_set"]
+    )
+
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
         f.write("Summary Report\n")
         f.write(f"Input Folder: {INPUT_FOLDER}\n")
         f.write(f"Output Folder: {OUTPUT_FOLDER}\n\n")
 
+        # Your new totals
+        f.write(f"Total Lines Written: {total_lines_written}\n")
         f.write(f"Total Input Files Scanned: {summary['files_scanned']}\n")
+        f.write(f"Total Files Written: {total_files_written}\n")
+        f.write(f"Total Files Written (Regex Types): {total_files_written_regex}\n")
+        f.write(f"Total Files Written (Keyword Types): {total_files_written_keyword}\n\n")
+
         f.write(f"Total Lines Scanned: {summary['lines_scanned']}\n")
         f.write(f"Total Lines Dropped (no matches): {summary['lines_dropped']}\n\n")
 
@@ -379,11 +376,14 @@ def main():
         "files_scanned": len(files),
         "lines_scanned": 0,
         "lines_dropped": 0,
-        "per_type_counts": defaultdict(int),       # folder -> lines written
-        "output_files_per_type": defaultdict(int), # folder -> files created
-        "skipped_keywords": defaultdict(int),      # folder -> count
+        "per_type_counts": defaultdict(int),
+        "output_files_per_type": defaultdict(int),
+        "skipped_keywords": defaultdict(int),
         "failed_files": [],
         "errors": [],
+        # sets for summary splits
+        "keyword_folders_set": KEYWORD_FOLDERS_SET,
+        "regex_folders_set": REGEX_FOLDERS_SET,
     }
 
     writer = WriterManager(out_root, LINES_PER_FILE)
@@ -402,7 +402,6 @@ def main():
             if result["errors"]:
                 summary["errors"].extend(result["errors"])
 
-            # Stream writes using ONLY clean folder names
             for kind, folder, line in result["results"]:
                 writer.write(kind, folder, line)
                 summary["per_type_counts"][folder] += 1
