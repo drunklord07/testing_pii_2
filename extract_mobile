@@ -21,6 +21,7 @@ MIRROR_TRUNCATE = 1500                  # max chars of log_line kept in mirror o
 SUMMARY_REFRESH_INTERVAL = 30           # seconds (live summary rewrite)
 QUEUE_MAXSIZE   = 10000                 # queue capacity for backpressure
 BATCH_FLUSH_EVERY = 500                 # send batches from workers to cut IPC overhead
+
 # JSON nested key-path inference (hardcoded per your request)
 NESTED_JSON_DETECT   = True       # enable nested JSON key-path inference
 FIELD_PATH_MODE      = "full"     # "last" -> just the leaf key; or "full" -> dotted path
@@ -60,17 +61,17 @@ def make_patterns(mobile_escaped: str):
         rf'<\s*(?P<field>[A-Za-z0-9_.\-]+)[^>]*>[^<]*?(?P<mobile>{mobile_escaped})[^<]*?</\s*\1\s*>',
         re.IGNORECASE | re.DOTALL,
     )
-    # 5) NEW: Bracketed keys: [MobileNo: 987...] or [Phone=987...]
+    # 5) Bracketed keys: [MobileNo: 987...] or [Phone=987...]
     p_bracketed = re.compile(
         rf'\[\s*(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<mobile>{mobile_escaped})\s*\]',
         re.IGNORECASE,
     )
-    # 6a) NEW: Curly fragments: {custId=123, phone=987...}
+    # 6a) Curly fragments: {custId=123, phone=987...}
     p_curly = re.compile(
         rf'\{{[^}}]*?(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<mobile>{mobile_escaped})(?:[^}}]*?)\}}',
         re.IGNORECASE,
     )
-    # 6b) NEW: XML inline: <field name=mobile>987...</field>
+    # 6b) XML inline: <field name=mobile>987...</field>
     p_xml_inline = re.compile(
         rf'<[^>]*?\bname\s*=\s*["\']?(?P<field>[A-Za-z0-9_.\-]+)["\']?[^>]*>'
         rf'[^<]*?(?P<mobile>{mobile_escaped})[^<]*?</[^>]+>',
@@ -79,6 +80,7 @@ def make_patterns(mobile_escaped: str):
     return (p_json_quoted, p_kv, p_xml_attr, p_xml_tag, p_bracketed, p_curly, p_xml_inline)
 
 
+# ---------- nested JSON helpers ----------
 def _quote_aware_scan_levels(s: str):
     """
     Precompute nesting level ({} / []) at each index, ignoring braces inside strings.
@@ -118,22 +120,17 @@ def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_
         return None
     L = max(0, val_start - window)
     slice_s = s[L:val_start]
-    # Precompute depth levels for the slice; offset when reading
     lvl = _quote_aware_scan_levels(slice_s)
-    # Depth at the value position (relative to slice end)
-    depth_at_val = lvl[-1]
 
     candidates = []
     for m in _key_colon_re.finditer(slice_s):
         k = m.group('k').strip()
-        pos_after_colon = m.end()
         key_depth = lvl[m.start()]  # level before the quote
-        candidates.append((m.start(), pos_after_colon, key_depth, k))
+        candidates.append((m.start(), m.end(), key_depth, k))
 
     if not candidates:
         return None
 
-    # Choose the last candidate whose value likely spans to our val_start
     best_key = None
     best_key_depth = -1
     for start_idx, after_colon, key_depth, key in reversed(candidates):
@@ -179,7 +176,7 @@ def identify_field_for_mobile(log_line: str, mobile: str):
             if field:
                 return field
 
-    # Fallback: nested JSON key inference (hardcoded ON; full path)
+    # Fallback: nested JSON key inference (ON; full path)
     if NESTED_JSON_DETECT:
         idx = log_line.find(mobile)
         if idx != -1:
@@ -208,7 +205,7 @@ def process_file(path: Path, extracted_q, mirror_q):
     path_only_samples = []
     file_failed = False
 
-    # Localize globals for speed in the hot loop
+    # Localize globals for speed
     mobile_re = MOBILE_RE
     identify = identify_field_for_mobile
     trunc = MIRROR_TRUNCATE
@@ -261,14 +258,14 @@ def process_file(path: Path, extracted_q, mirror_q):
                             per_field_example[field] = row.strip()
                         line_had_extracted = True
                     else:
-                        # Mirror without reason flag, per your request
+                        # Mirror without reason flag (as requested)
                         short_log = (log_line[:trunc] + "...TRUNCATED...") if len(log_line) > trunc else log_line
                         row = f"{short_log} ; {file_path} ; UNIDENTIFIED_FIELD ; mobile_regex ; {mobile_val}\n"
                         mirr_buf.append(row)
                         stats["mirrored_matches"] += 1
                         line_had_mirrored = True
 
-                    # Batch flush to reduce IPC overhead
+                    # Batch flush
                     if len(extr_buf) >= batch_n:
                         _flush_batch(extracted_q, extr_buf)
                     if len(mirr_buf) >= batch_n:
@@ -300,9 +297,12 @@ def writer_loop(queue: mp.Queue, base_dir: Path, prefix: str, chunk_size: int):
     fh = (base_dir / f"{prefix}_{counter:03d}.txt").open("w", encoding="utf-8")
     try:
         while True:
-            item = queue.get()  # blocking, no polling
+            item = queue.get()  # blocking
             if item is SENTINEL:
                 break
+            if not isinstance(item, str):
+                # safety: ignore anything not a string (prevents TypeError on write)
+                continue
             fh.write(item)
             lines += item.count("\n")
             if lines >= chunk_size:
@@ -386,7 +386,7 @@ def write_summary(input_dir: Path,
         sf.write("- Extraction strictly on allowed field→value patterns (incl. brackets/curly/XML-inline).\n")
         sf.write("- Nested-JSON key-path inference enabled; returns dotted paths.\n")
         sf.write("- One output row per regex match. Path-only matches dropped.\n")
-        sf.write("- Mirror rows truncate log_line; reason flag omitted by request.\n")
+        sf.write("- Mirror rows truncate log_line; reason flag omitted.\n")
 
 
 def summary_refresher_loop(input_dir: Path,
