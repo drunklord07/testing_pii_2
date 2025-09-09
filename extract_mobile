@@ -13,15 +13,16 @@ from datetime import datetime
 from tqdm import tqdm
 
 # ============= CONFIG ============= #
-INPUT_FOLDER    = "input_logs"          # put your input folder name here (in current dir)
-OUTPUT_FOLDER   = "output_mobile"       # outputs will be created under this
+INPUT_FOLDER    = "input_logs"            # put your input folder name here (in current dir)
+OUTPUT_FOLDER   = "output_mobile_regex"   # outputs will be created under this
 MAX_WORKERS     = 6
-CHUNK_SIZE      = 10_000                # files of 10k rows each
-MIRROR_TRUNCATE = 1500                  # max chars of log_line kept in mirror output
-SUMMARY_REFRESH_INTERVAL = 30           # seconds (live summary rewrite)
-QUEUE_MAXSIZE   = 10000                 # queue capacity for backpressure
-BATCH_FLUSH_EVERY = 500                 # send batches from workers to cut IPC overhead
+CHUNK_SIZE      = 10_000                  # files of 10k rows each
+MIRROR_TRUNCATE = 1500                    # max chars of log_line kept in mirror output
+SUMMARY_REFRESH_INTERVAL = 30             # seconds (live summary rewrite)
+QUEUE_MAXSIZE   = 10000                   # queue capacity for backpressure
+BATCH_FLUSH_EVERY = 500                   # worker builds rows in-memory, but batches reduce reallocs
 
+RESUME_LOG      = Path(OUTPUT_FOLDER) / "resume_files.log"   # tracks successfully processed files
 # JSON nested key-path inference (hardcoded per your request)
 NESTED_JSON_DETECT   = True       # enable nested JSON key-path inference
 FIELD_PATH_MODE      = "full"     # "last" -> just the leaf key; or "full" -> dotted path
@@ -82,10 +83,6 @@ def make_patterns(mobile_escaped: str):
 
 # ---------- nested JSON helpers ----------
 def _quote_aware_scan_levels(s: str):
-    """
-    Precompute nesting level ({} / []) at each index, ignoring braces inside strings.
-    Returns a list `lvl` where lvl[i] is the object/array depth BEFORE s[i].
-    """
     lvl = [0] * (len(s) + 1)
     depth = 0
     in_str = False
@@ -111,11 +108,6 @@ def _quote_aware_scan_levels(s: str):
 _key_colon_re = re.compile(r'"(?P<k>[^"\\]+)"\s*:')
 
 def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_mode: str = "last"):
-    """
-    Heuristic: within a backscan window, find the nearest JSON key at the same or enclosing depth
-    that plausibly owns the value starting at val_start.
-    Returns either the leaf key or dotted path, or None.
-    """
     if val_start <= 0:
         return None
     L = max(0, val_start - window)
@@ -125,7 +117,7 @@ def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_
     candidates = []
     for m in _key_colon_re.finditer(slice_s):
         k = m.group('k').strip()
-        key_depth = lvl[m.start()]  # level before the quote
+        key_depth = lvl[m.start()]
         candidates.append((m.start(), m.end(), key_depth, k))
 
     if not candidates:
@@ -156,7 +148,6 @@ def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_
     if path_mode == "last":
         return best_key
 
-    # Build dotted path by walking backwards to collect ancestor keys at decreasing depths
     path = [best_key]
     target_depth = best_key_depth
     for start_idx, after_colon, key_depth, key in reversed(candidates):
@@ -176,7 +167,6 @@ def identify_field_for_mobile(log_line: str, mobile: str):
             if field:
                 return field
 
-    # Fallback: nested JSON key inference (ON; full path)
     if NESTED_JSON_DETECT:
         idx = log_line.find(mobile)
         if idx != -1:
@@ -192,20 +182,18 @@ def identify_field_for_mobile(log_line: str, mobile: str):
     return None
 
 
-def _flush_batch(q, buf):
-    if buf:
-        q.put("".join(buf))
-        buf.clear()
-
-
-def process_file(path: Path, extracted_q, mirror_q):
+def process_file(path: Path):
+    """
+    Worker function (Windows-safe): returns results as strings, not via queues.
+    Returns:
+      stats, per_field_counts, per_field_example, path_only_samples, file_failed, extracted_str, mirror_str
+    """
     stats = defaultdict(int)
     per_field_counts = defaultdict(int)
     per_field_example = {}
     path_only_samples = []
     file_failed = False
 
-    # Localize globals for speed
     mobile_re = MOBILE_RE
     identify = identify_field_for_mobile
     trunc = MIRROR_TRUNCATE
@@ -250,45 +238,42 @@ def process_file(path: Path, extracted_q, mirror_q):
                     field = identify(log_line, mobile_val)
 
                     if field:
-                        row = f"{log_line} ; {file_path} ; {field} ; mobile_regex ; {mobile_val}\n"
-                        extr_buf.append(row)
+                        extr_buf.append(f"{log_line} ; {file_path} ; {field} ; mobile_regex ; {mobile_val}\n")
                         stats["extracted_matches"] += 1
                         per_field_counts[field] += 1
                         if field not in per_field_example:
-                            per_field_example[field] = row.strip()
+                            per_field_example[field] = f"{log_line} ; {file_path} ; {field} ; mobile_regex ; {mobile_val}"
                         line_had_extracted = True
                     else:
-                        # Mirror without reason flag (as requested)
                         short_log = (log_line[:trunc] + "...TRUNCATED...") if len(log_line) > trunc else log_line
-                        row = f"{short_log} ; {file_path} ; UNIDENTIFIED_FIELD ; mobile_regex ; {mobile_val}\n"
-                        mirr_buf.append(row)
+                        mirr_buf.append(f"{short_log} ; {file_path} ; UNIDENTIFIED_FIELD ; mobile_regex ; {mobile_val}\n")
                         stats["mirrored_matches"] += 1
                         line_had_mirrored = True
 
-                    # Batch flush
+                    # cheap batch hint – keeps list sizes reasonable
                     if len(extr_buf) >= batch_n:
-                        _flush_batch(extracted_q, extr_buf)
+                        pass
                     if len(mirr_buf) >= batch_n:
-                        _flush_batch(mirror_q, mirr_buf)
+                        pass
 
                 if line_had_extracted and line_had_mirrored:
                     stats["partial_valid_lines"] += 1
 
-        # final flush for this file
-        _flush_batch(extracted_q, extr_buf)
-        _flush_batch(mirror_q, mirr_buf)
-
     except Exception as e:
         stats["errors"] += 1
         file_failed = True
+        # Log inside worker too (in case main dies)
         try:
+            ERRORS_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
                 ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] {path}: {e}\n")
                 ef.write(traceback.format_exc() + "\n")
         except Exception:
             pass
 
-    return stats, per_field_counts, per_field_example, path_only_samples, file_failed
+    extracted_str = "".join(extr_buf)
+    mirror_str    = "".join(mirr_buf)
+    return stats, per_field_counts, per_field_example, path_only_samples, file_failed, extracted_str, mirror_str, str(path)
 
 
 def writer_loop(queue: mp.Queue, base_dir: Path, prefix: str, chunk_size: int):
@@ -301,7 +286,8 @@ def writer_loop(queue: mp.Queue, base_dir: Path, prefix: str, chunk_size: int):
             if item is SENTINEL:
                 break
             if not isinstance(item, str):
-                # safety: ignore anything not a string (prevents TypeError on write)
+                continue
+            if not item:
                 continue
             fh.write(item)
             lines += item.count("\n")
@@ -352,7 +338,7 @@ def write_summary(input_dir: Path,
 
         if failed_files:
             sf.write("FAILED FILES\n")
-            for f in failed_files:
+            for f in failed_files[:100]:
                 sf.write(f"- {f}\n")
             sf.write("\n")
 
@@ -409,6 +395,23 @@ def summary_refresher_loop(input_dir: Path,
         stop_event.wait(SUMMARY_REFRESH_INTERVAL)
 
 
+def load_resume_set() -> set:
+    if RESUME_LOG.exists():
+        try:
+            return set(p.strip() for p in RESUME_LOG.read_text(encoding="utf-8", errors="ignore").splitlines() if p.strip())
+        except Exception:
+            return set()
+    return set()
+
+
+def append_resume(path_str: str):
+    try:
+        with open(RESUME_LOG, "a", encoding="utf-8") as f:
+            f.write(path_str + "\n")
+    except Exception:
+        pass
+
+
 def main():
     input_dir = Path(INPUT_FOLDER)
     if not input_dir.exists():
@@ -419,20 +422,24 @@ def main():
     OUT_FIELDS_DIR.mkdir(parents=True, exist_ok=True)
     OUT_MIRROR_DIR.mkdir(parents=True, exist_ok=True)
 
+    # discover files
     files = [p for p in input_dir.rglob("*.txt")]
     if not files:
         print("No .txt files found in input.")
         write_summary(input_dir, defaultdict(int), {}, {}, [], [], stage="Final")
         sys.exit(0)
 
+    # resume support
+    already = load_resume_set()
+    files = [p for p in files if str(p) not in already]
     random.shuffle(files)
 
-    # Fast, real multiprocessing queues (no Manager proxy).
+    # Queues live only in main process (Windows-safe)
     ctx = mp.get_context("spawn")
     extracted_q: mp.Queue = ctx.Queue(maxsize=QUEUE_MAXSIZE)
     mirror_q:    mp.Queue = ctx.Queue(maxsize=QUEUE_MAXSIZE)
 
-    # Start writers (they terminate on SENTINEL)
+    # Start writers
     t_extr = threading.Thread(target=writer_loop, args=(extracted_q, OUT_FIELDS_DIR, "extracted", CHUNK_SIZE), daemon=True)
     t_mirr = threading.Thread(target=writer_loop, args=(mirror_q, OUT_MIRROR_DIR, "mirror", CHUNK_SIZE), daemon=True)
     t_extr.start()
@@ -444,8 +451,9 @@ def main():
     G_path_only_samples = []
     failed_files = []
 
-    G_stats["files_total"] = len(files)
-
+    # File counters reflect skipped via resume
+    G_stats["files_total"] = len(files) + len(already)
+    G_stats["files_processed"] += len(already)  # already done
     # Live summary refresher
     stop_event = threading.Event()
     refresher = threading.Thread(target=summary_refresher_loop,
@@ -453,58 +461,73 @@ def main():
                                  daemon=True)
     refresher.start()
 
-    # Process files
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as ex:
-        futures = {ex.submit(process_file, p, extracted_q, mirror_q): p for p in files}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
-            path = futures[fut]
-            try:
-                stats, field_counts, field_example, path_only, file_failed = fut.result()
-                if file_failed:
+    try:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as ex:
+            futures = {ex.submit(process_file, p): p for p in files}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
+                path = futures[fut]
+                try:
+                    (stats, field_counts, field_example, path_only,
+                     file_failed, extracted_str, mirror_str, path_str) = fut.result()
+
+                    if file_failed:
+                        G_stats["files_failed"] += 1
+                        failed_files.append(path_str)
+                    else:
+                        G_stats["files_processed"] += 1
+                        append_resume(path_str)  # mark done
+
+                    # aggregate stats
+                    for k, v in stats.items():
+                        G_stats[k] += v
+                    for k, v in field_counts.items():
+                        G_field_counts[k] += v
+                    for k, v in field_example.items():
+                        if k not in G_field_example:
+                            G_field_example[k] = v
+                    if path_only:
+                        take = 50 - len(G_path_only_samples)
+                        if take > 0:
+                            G_path_only_samples.extend(path_only[:take])
+
+                    # feed writers (strings)
+                    if extracted_str:
+                        extracted_q.put(extracted_str)
+                    if mirror_str:
+                        mirror_q.put(mirror_str)
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
                     G_stats["files_failed"] += 1
                     failed_files.append(str(path))
-                else:
-                    G_stats["files_processed"] += 1
+                    try:
+                        with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
+                            ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] {path}: {e}\n")
+                            ef.write(traceback.format_exc() + "\n")
+                    except Exception:
+                        pass
+    except KeyboardInterrupt:
+        print("\n^C detected — shutting down gracefully...")
+    finally:
+        # Always close writers
+        extracted_q.put(SENTINEL)
+        mirror_q.put(SENTINEL)
+        t_extr.join()
+        t_mirr.join()
 
-                for k, v in stats.items():
-                    G_stats[k] += v
-                for k, v in field_counts.items():
-                    G_field_counts[k] += v
-                for k, v in field_example.items():
-                    if k not in G_field_example:
-                        G_field_example[k] = v
-                if path_only:
-                    take = 50 - len(G_path_only_samples)
-                    if take > 0:
-                        G_path_only_samples.extend(path_only[:take])
-            except Exception as e:
-                G_stats["files_failed"] += 1
-                failed_files.append(str(path))
-                try:
-                    with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
-                        ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] {path}: {e}\n")
-                        ef.write(traceback.format_exc() + "\n")
-                except Exception:
-                    pass
+        # stop refresher and write final summary
+        stop_event.set()
+        refresher.join(timeout=2)
+        write_summary(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, failed_files, stage="Final")
 
-    # Graceful writer shutdown: send one SENTINEL per writer
-    extracted_q.put(SENTINEL)
-    mirror_q.put(SENTINEL)
-    t_extr.join()
-    t_mirr.join()
-
-    # Stop refresher and write final summary
-    stop_event.set()
-    refresher.join(timeout=2)
-    write_summary(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, failed_files, stage="Final")
-
-    print("\n✅ Done.")
-    print(f"Total files: {G_stats['files_total']}  |  Processed: {G_stats['files_processed']}  |  Failed: {G_stats['files_failed']}")
-    print(f"Extracted files in: {OUT_FIELDS_DIR.resolve()}")
-    print(f"Mirror files in:    {OUT_MIRROR_DIR.resolve()}")
-    print(f"Summary:            {SUMMARY_FILE.resolve()}")
-    if G_stats['files_failed'] > 0:
-        print(f"Errors logged:      {ERRORS_FILE.resolve()}")
+        print("\n✅ Done.")
+        print(f"Total files: {G_stats['files_total']}  |  Processed: {G_stats['files_processed']}  |  Failed: {G_stats['files_failed']}")
+        print(f"Extracted files in: {OUT_FIELDS_DIR.resolve()}")
+        print(f"Mirror files in:    {OUT_MIRROR_DIR.resolve()}")
+        print(f"Summary:            {SUMMARY_FILE.resolve()}")
+        if G_stats['files_failed'] > 0:
+            print(f"Errors logged:      {ERRORS_FILE.resolve()}")
 
 
 if __name__ == "__main__":
