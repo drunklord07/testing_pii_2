@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+validate_mobile_counts.py
+Fast validator: scans input *.txt and reports counts using the SAME logic as the extractor:
+- Strict MOBILE_RE
+- Split "log_line ; path" (only log_line is considered; path-only matches are dropped)
+- Per-line de-dup by field (one extracted row per unique field per line)
+- At most one mirror row per line if any unidentified match
+- Nested JSON key-path inference (FIELD_PATH_MODE='full')
+
+No data is written — just a final report (and an optional CSV of per-field counts if you enable it).
+"""
+
+import re
+import sys
+import random
+import json
+from pathlib import Path
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from datetime import datetime
+from tqdm import tqdm
+
+# ======== CONFIG ======== #
+INPUT_FOLDER    = "input_logs"      # folder with *.txt
+MAX_WORKERS     = 6
+JSON_BACKSCAN_WINDOW = 800
+FIELD_PATH_MODE = "full"            # "full" for dotted path, or "last"
+REPORT_TOP_FIELDS = 100             # how many fields to list in the report
+# ======================== #
+
+# Strict mobile regex (India 10 or prefixed 91 + 10); prevents A–Z / 0–9 adjacency
+MOBILE_RE = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
+
+# ---------- field detection patterns (same as extractor) ----------
+def make_patterns(value_escaped: str):
+    p_json_quoted = re.compile(
+        rf'["\']\s*(?P<field>[^"\']+?)\s*["\']\s*[:=]\s*["\']?(?P<value>{value_escaped})["\']?',
+        re.IGNORECASE,
+    )
+    p_kv = re.compile(
+        rf'\b(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*["\']?(?P<value>{value_escaped})["\']?',
+        re.IGNORECASE,
+    )
+    p_xml_attr = re.compile(
+        rf'<[^>]*\b(?P<field>[A-Za-z0-9_.\-]+)\s*=\s*["\'](?P<value>{value_escaped})["\'][^>]*>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    p_xml_tag = re.compile(
+        rf'<\s*(?P<field>[A-Za-z0-9_.\-]+)[^>]*>[^<]*?(?P<value>{value_escaped})[^<]*?</\s*\1\s*>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    p_bracketed = re.compile(
+        rf'\[\s*(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<value>{value_escaped})\s*\]',
+        re.IGNORECASE,
+    )
+    p_curly = re.compile(
+        rf'\{{[^}}]*?(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<value>{value_escaped})(?:[^}}]*?)\}}',
+        re.IGNORECASE,
+    )
+    p_xml_inline = re.compile(
+        rf'<[^>]*?\bname\s*=\s*["\']?(?P<field>[A-Za-z0-9_.\-]+)["\']?[^>]*>'
+        rf'[^<]*?(?P<value>{value_escaped})[^<]*?</[^>]+>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    return (p_json_quoted, p_kv, p_xml_attr, p_xml_tag, p_bracketed, p_curly, p_xml_inline)
+
+# ---------- nested JSON helpers (same as extractor) ----------
+def _quote_aware_scan_levels(s: str):
+    lvl = [0]*(len(s)+1)
+    depth = 0
+    in_str = False
+    esc = False
+    for i,ch in enumerate(s):
+        if in_str:
+            if esc: esc=False
+            elif ch == '\\': esc=True
+            elif ch == '"': in_str=False
+        else:
+            if ch == '"': in_str=True
+            elif ch in '{[': depth += 1
+            elif ch in '}]' and depth>0: depth -= 1
+        lvl[i+1] = depth
+    return lvl
+
+_key_colon_re = re.compile(r'"(?P<k>[^"\\]+)"\s*:')
+
+def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_mode: str = "last"):
+    if val_start <= 0:
+        return None
+    L = max(0, val_start - window)
+    slice_s = s[L:val_start]
+    lvl = _quote_aware_scan_levels(slice_s)
+
+    cands = []
+    for m in _key_colon_re.finditer(slice_s):
+        k = m.group('k').strip()
+        key_depth = lvl[m.start()]
+        cands.append((m.start(), m.end(), key_depth, k))
+    if not cands:
+        return None
+
+    best_key = None
+    best_depth = -1
+    for start_idx, after_colon, key_depth, key in reversed(cands):
+        cut = False
+        base_depth = lvl[start_idx]
+        for i in range(after_colon, len(slice_s)):
+            if slice_s[i] == ',' and lvl[i] == base_depth and (L + i) < val_start:
+                cut = True; break
+            if slice_s[i] in '}]' and lvl[i+1] < base_depth and (L + i) < val_start:
+                cut = True; break
+        if not cut:
+            best_key = key
+            best_depth = key_depth
+            break
+
+    if best_key is None:
+        return None
+
+    if path_mode == "last":
+        return best_key
+
+    path = [best_key]
+    target_depth = best_depth
+    for start_idx, after_colon, key_depth, key in reversed(cands):
+        if key_depth < target_depth:
+            path.append(key)
+            target_depth = key_depth
+    path.reverse()
+    return ".".join(path)
+
+def identify_field_for_value(log_line: str, value: str):
+    val_esc = re.escape(value)
+    for pat in make_patterns(val_esc):
+        m = pat.search(log_line)
+        if m:
+            fld = m.group("field").strip()
+            if fld:
+                return fld
+    idx = log_line.find(value)
+    if idx != -1:
+        key_or_path = _nearest_json_key_for_value(
+            log_line, idx, JSON_BACKSCAN_WINDOW, FIELD_PATH_MODE
+        )
+        if key_or_path:
+            return key_or_path
+    return None
+
+# ---------- worker ----------
+def process_file(path: Path):
+    stats = defaultdict(int)
+    per_field_counts = defaultdict(int)
+
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+
+                # Split "log_line ; file_path" (same as extractor)
+                if ";" in line:
+                    log_line, file_path = line.rsplit(";", 1)
+                else:
+                    log_line, file_path = line, ""
+
+                matches = list(MOBILE_RE.finditer(line))
+                if not matches:
+                    stats["lines_no_regex"] += 1
+                    continue
+
+                split_at = len(log_line)
+                log_matches  = [m for m in matches if m.start() < split_at]
+                path_matches = [m for m in matches if m.start() >= split_at]
+
+                stats["total_regex_matches"]   += len(matches)
+                stats["dropped_path_only"]     += len(path_matches)
+
+                if not log_matches:
+                    # only path matches -> continue
+                    continue
+
+                # Per-line de-dup by field
+                field_first_value = {}
+                unidentified_present = False
+
+                for m in log_matches:
+                    mob = m.group(0)
+                    fld = identify_field_for_value(log_line, mob)
+                    if fld:
+                        key = fld.strip().lower()
+                        if key not in field_first_value:
+                            field_first_value[key] = (fld, mob)
+                    else:
+                        unidentified_present = True
+
+                # derived “output rows” (no writing, just counting)
+                had_extr = False
+                for key, (fld, mob) in field_first_value.items():
+                    stats["extracted_rows"] += 1
+                    per_field_counts[fld] += 1
+                    had_extr = True
+
+                had_mirr = False
+                if unidentified_present:
+                    stats["mirror_rows"] += 1
+                    had_mirr = True
+
+                if had_extr and had_mirr:
+                    stats["partial_valid_lines"] += 1
+
+    except Exception as e:
+        stats["errors"] += 1
+        # include file path once in case of errors
+        stats["failed_files"] = stats.get("failed_files", 0) + 1
+
+    return dict(stats), dict(per_field_counts), str(path)
+
+# ---------- main ----------
+def main():
+    input_dir = Path(INPUT_FOLDER)
+    if not input_dir.exists():
+        print(f"Input folder not found: {input_dir.resolve()}")
+        sys.exit(1)
+
+    files = [p for p in input_dir.rglob("*.txt")]
+    if not files:
+        print("No .txt files found.")
+        sys.exit(0)
+
+    random.shuffle(files)
+
+    G_stats = defaultdict(int)
+    G_field_counts = defaultdict(int)
+    failed_files = []
+
+    ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as ex:
+        futs = {ex.submit(process_file, p): p for p in files}
+        for fut in tqdm(as_completed(futs), total=len(futs), desc="Validating"):
+            path = futs[fut]
+            try:
+                stats, pfc, _ = fut.result()
+                for k, v in stats.items():
+                    if isinstance(v, int):
+                        G_stats[k] += v
+                for fld, cnt in pfc.items():
+                    G_field_counts[fld] += cnt
+            except Exception as e:
+                failed_files.append(str(path))
+                G_stats["errors"] += 1
+
+    # Report
+    total_files = len(files)
+    print("\nValidation Report -", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("="*70)
+    print("INPUT")
+    print(f"  Folder: {input_dir.resolve()}")
+    print(f"  Files discovered: {total_files}")
+    if failed_files:
+        print(f"  Files failed: {len(failed_files)}")
+        for fp in failed_files[:20]:
+            print("   -", fp)
+    else:
+        print("  Files failed: 0")
+
+    print("\nCOUNTS (raw vs. dedup logic)")
+    print(f"  Total regex matches (log+path): {G_stats.get('total_regex_matches',0)}")
+    print(f"    Dropped (path-only matches):  {G_stats.get('dropped_path_only',0)}")
+    print(f"    Lines with no regex (dropped lines): {G_stats.get('lines_no_regex',0)}")
+    print(f"  Output rows (dedup):")
+    print(f"    Extracted rows: {G_stats.get('extracted_rows',0)}   "
+          f"Mirror rows: {G_stats.get('mirror_rows',0)}   "
+          f"Partial-valid lines: {G_stats.get('partial_valid_lines',0)}")
+    print(f"  Errors: {G_stats.get('errors',0)}")
+
+    # Top fields
+    if G_field_counts:
+        print("\nTOP FIELDS (extracted, dedup)")
+        for i,(fld,cnt) in enumerate(sorted(G_field_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:REPORT_TOP_FIELDS], 1):
+            print(f"  {i:>3}. {fld} = {cnt}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n^C — aborted.")
