@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import time
+import sqlite3
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Tuple, Dict
+from tqdm import tqdm
+
+# ====== CONFIGURATION ====== #
+INPUT_FOLDER = "input_logs"         # Folder with .txt inputs (recursive)
+OUTPUT_FOLDER = "cleaned_output"    # Deduped outputs with chunks
+SUMMARY_FILE = "summary_report.txt" # Saved in current working dir
+RESUME_LOG = "resume_files.log"     # Checkpoint log
+MAX_WORKERS = 6                     # Parallelism
+ALLOWED_EXTS = (".txt",)            # Process only .txt files
+DEDUP_DB = os.path.join(OUTPUT_FOLDER, ".dedup_index.sqlite")  # Shared DB
+DEDUP_BATCH = 5000                  # DB transaction batch size
+CHUNK_SIZE = 10000                  # Lines per output chunk
+# =========================== #
+
+def find_all_txt_files(root: str) -> List[Tuple[str, str]]:
+    files: List[Tuple[str, str]] = []
+    root_p = Path(root).resolve()
+    for dirpath, _dirs, filenames in os.walk(root):
+        for fn in filenames:
+            if os.path.splitext(fn)[1].lower() in ALLOWED_EXTS:
+                abs_p = Path(dirpath) / fn
+                rel_p = abs_p.resolve().relative_to(root_p).as_posix()
+                files.append((str(abs_p), rel_p))
+    files.sort(key=lambda x: x[1])
+    return files
+
+def _init_db(db_path: str) -> None:
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path, timeout=60, isolation_level=None)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        cur.execute("PRAGMA temp_store=MEMORY;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lines (
+                line TEXT PRIMARY KEY
+            )
+        """)
+        cur.close()
+    finally:
+        conn.close()
+
+def _open_db(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+def process_file(args: Tuple[str, str, str]) -> Dict[str, object]:
+    abs_in_path, rel_path, db_path = args
+    local = {
+        "file_rel": rel_path,
+        "lines_processed": 0,
+        "unique_kept": 0,
+        "duplicates_removed": 0,
+        "error": None,
+        "chunks_written": 0,
+    }
+
+    # Prepare output folder path
+    out_dir = Path(OUTPUT_FOLDER) / Path(rel_path).parent
+    os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        conn = _open_db(db_path)
+        cur = conn.cursor()
+        cur.execute("BEGIN;")
+        pending = 0
+
+        chunk_idx = 1
+        line_in_chunk = 0
+        out_path = out_dir / f"{Path(rel_path).stem}_part{chunk_idx}.txt"
+        f_out = open(out_path, "w", encoding="utf-8")
+        local["chunks_written"] += 1
+
+        with open(abs_in_path, "r", encoding="utf-8", errors="ignore") as f_in:
+            for line in f_in:
+                local["lines_processed"] += 1
+                try:
+                    cur.execute("INSERT OR IGNORE INTO lines(line) VALUES (?)", (line,))
+                    if cur.rowcount == 1:
+                        f_out.write(line)
+                        local["unique_kept"] += 1
+                        line_in_chunk += 1
+                        pending += 1
+
+                        if line_in_chunk >= CHUNK_SIZE:
+                            f_out.close()
+                            chunk_idx += 1
+                            out_path = out_dir / f"{Path(rel_path).stem}_part{chunk_idx}.txt"
+                            f_out = open(out_path, "w", encoding="utf-8")
+                            local["chunks_written"] += 1
+                            line_in_chunk = 0
+
+                    else:
+                        local["duplicates_removed"] += 1
+
+                    if pending >= DEDUP_BATCH:
+                        conn.commit()
+                        cur.execute("BEGIN;")
+                        pending = 0
+
+                except sqlite3.OperationalError:
+                    conn.commit()
+                    cur.execute("BEGIN;")
+                    cur.execute("INSERT OR IGNORE INTO lines(line) VALUES (?)", (line,))
+                    if cur.rowcount == 1:
+                        f_out.write(line)
+                        local["unique_kept"] += 1
+                        line_in_chunk += 1
+                    else:
+                        local["duplicates_removed"] += 1
+
+        f_out.close()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        try:
+            if "f_out" in locals() and not f_out.closed:
+                f_out.close()
+        except Exception:
+            pass
+        err = f"{rel_path}: {e.__class__.__name__}: {e}"
+        err += "\n" + "".join(traceback.format_exception_only(type(e), e)).strip()
+        local["error"] = err
+
+    return local
+
+def load_completed_set(log_path: str) -> set:
+    completed = set()
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                p = line.strip()
+                if p and not p.startswith("#"):
+                    completed.add(p)
+    return completed
+
+def append_completed(log_path: str, rel_path: str):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(rel_path + "\n")
+
+def write_summary(summary):
+    summary["end_ts"] = time.time()
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write(f"Global Dedup with Chunking - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Input Folder:  {os.path.abspath(INPUT_FOLDER)}\n")
+        f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
+        f.write(f"Chunk Size:    {CHUNK_SIZE}\n")
+        f.write(f"Index DB:      {os.path.abspath(DEDUP_DB)}\n")
+        f.write(f"Max Workers:   {summary['max_workers']}\n\n")
+
+        f.write("=== Files ===\n")
+        f.write(f"Discovered: {summary['files_discovered']}\n")
+        f.write(f"Processed:  {summary['files_scanned']}\n")
+        f.write(f"Success:    {summary['files_success']}\n")
+        f.write(f"Errors:     {summary['files_error']}\n\n")
+
+        f.write("=== Lines ===\n")
+        f.write(f"Total processed:         {summary['total_lines_processed']}\n")
+        f.write(f"Total unique kept:       {summary['total_unique_kept']}\n")
+        f.write(f"Total duplicates removed:{summary['total_duplicates_removed']}\n\n")
+
+        f.write("=== Chunks ===\n")
+        f.write(f"Total chunks written:    {summary['total_chunks_written']}\n\n")
+
+        if summary["errors"]:
+            f.write("=== Errors ===\n")
+            for err in summary["errors"]:
+                f.write(f"- {err}\n")
+
+def main():
+    if not os.path.isdir(INPUT_FOLDER):
+        print(f"ERROR: INPUT_FOLDER does not exist: {INPUT_FOLDER}", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    _init_db(DEDUP_DB)
+
+    all_files = find_all_txt_files(INPUT_FOLDER)
+    if not all_files:
+        print("No input files found.", file=sys.stderr)
+        return
+
+    completed = load_completed_set(RESUME_LOG)
+    pending = [(abs_p, rel_p) for (abs_p, rel_p) in all_files if rel_p not in completed]
+
+    if not pending:
+        print("All files already processed per resume log.")
+        return
+
+    summary = {
+        "start_ts": time.time(),
+        "end_ts": None,
+        "max_workers": MAX_WORKERS,
+        "files_discovered": len(all_files),
+        "files_scanned": 0,
+        "files_success": 0,
+        "files_error": 0,
+        "total_lines_processed": 0,
+        "total_unique_kept": 0,
+        "total_duplicates_removed": 0,
+        "total_chunks_written": 0,
+        "errors": []
+    }
+
+    overall_bar = tqdm(total=len(pending), desc="Overall", unit="file", leave=True)
+
+    try:
+        work_args = [(abs_p, rel_p, DEDUP_DB) for (abs_p, rel_p) in pending]
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(process_file, wa): wa for wa in work_args}
+            for fut in as_completed(futures):
+                _abs_in, rel_p, _db = futures[fut]
+                try:
+                    res = fut.result()
+                    summary["files_scanned"] += 1
+                    summary["total_lines_processed"] += res["lines_processed"]
+                    summary["total_unique_kept"] += res["unique_kept"]
+                    summary["total_duplicates_removed"] += res["duplicates_removed"]
+                    summary["total_chunks_written"] += res.get("chunks_written", 0)
+
+                    if res["error"]:
+                        summary["files_error"] += 1
+                        summary["errors"].append(res["error"])
+                    else:
+                        summary["files_success"] += 1
+                        append_completed(RESUME_LOG, rel_p)
+
+                except Exception as e:
+                    summary["files_scanned"] += 1
+                    summary["files_error"] += 1
+                    summary["errors"].append(f"{rel_p}: worker exception: {e}")
+
+                overall_bar.update(1)
+                elapsed = time.time() - summary["start_ts"]
+                avg = elapsed / max(1, summary["files_scanned"])
+                remaining = len(pending) - summary["files_scanned"]
+                eta = max(0, int(remaining * avg))
+                overall_bar.set_postfix_str(f"ETA: {str(timedelta(seconds=eta))}")
+
+    finally:
+        overall_bar.close()
+        write_summary(summary)
+
+if __name__ == "__main__":
+    main()
