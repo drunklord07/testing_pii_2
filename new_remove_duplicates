@@ -9,19 +9,20 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 
 # ====== CONFIGURATION ====== #
-INPUT_FOLDER = "input_logs"         # Folder with .txt inputs (recursive)
-OUTPUT_FOLDER = "cleaned_output"    # Deduped outputs with chunks
-SUMMARY_FILE = "summary_report.txt" # Saved in current working dir
-RESUME_LOG = "resume_files.log"     # Checkpoint log
-MAX_WORKERS = 6                     # Parallelism
-ALLOWED_EXTS = (".txt",)            # Process only .txt files
-DEDUP_DB = os.path.join(OUTPUT_FOLDER, ".dedup_index.sqlite")  # Shared DB
-DEDUP_BATCH = 5000                  # DB transaction batch size
-CHUNK_SIZE = 10000                  # Lines per output chunk
+INPUT_FOLDER   = "input_logs"          # recursive
+OUTPUT_FOLDER  = "cleaned_output"      # final chunkNNNN.txt files + staging dir
+SUMMARY_FILE   = "summary_report.txt"  # saved in CWD
+RESUME_LOG     = "resume_files.log"    # stores relative input paths that finished stage 1
+MAX_WORKERS    = 6
+ALLOWED_EXTS   = (".txt",)
+DEDUP_DB       = os.path.join(OUTPUT_FOLDER, ".dedup_index.sqlite")  # shared DB (no WAL)
+DEDUP_BATCH    = 5000                   # DB transaction batch size
+CHUNK_SIZE     = 10000                  # lines per final chunk file
+STAGING_DIR    = os.path.join(OUTPUT_FOLDER, "_staging")  # per-file staging uniques
 # =========================== #
 
 def find_all_txt_files(root: str) -> List[Tuple[str, str]]:
@@ -41,12 +42,12 @@ def _init_db(db_path: str) -> None:
     conn = sqlite3.connect(db_path, timeout=60, isolation_level=None)
     try:
         cur = conn.cursor()
-        cur.execute("PRAGMA journal_mode=WAL;")
+        # Default journaling (no WAL); keep safe timeouts.
         cur.execute("PRAGMA synchronous=NORMAL;")
         cur.execute("PRAGMA temp_store=MEMORY;")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS lines (
-                line TEXT PRIMARY KEY
+                line BLOB PRIMARY KEY
             )
         """)
         cur.close()
@@ -55,24 +56,26 @@ def _init_db(db_path: str) -> None:
 
 def _open_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=60)
-    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+def _stage_path_for(rel_path: str) -> str:
+    # One staging file per input file; flatten rel_path to a safe filename
+    safe = rel_path.replace("/", "__")
+    return os.path.join(STAGING_DIR, safe + ".stage")
+
 def process_file(args: Tuple[str, str, str]) -> Dict[str, object]:
     abs_in_path, rel_path, db_path = args
-    local = {
+    local: Dict[str, object] = {
         "file_rel": rel_path,
         "lines_processed": 0,
         "unique_kept": 0,
         "duplicates_removed": 0,
         "error": None,
-        "chunks_written": 0,
+        "staging_file": _stage_path_for(rel_path),
     }
 
-    # Prepare output folder path
-    out_dir = Path(OUTPUT_FOLDER) / Path(rel_path).parent
-    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(STAGING_DIR, exist_ok=True)
 
     try:
         conn = _open_db(db_path)
@@ -80,31 +83,16 @@ def process_file(args: Tuple[str, str, str]) -> Dict[str, object]:
         cur.execute("BEGIN;")
         pending = 0
 
-        chunk_idx = 1
-        line_in_chunk = 0
-        out_path = out_dir / f"{Path(rel_path).stem}_part{chunk_idx}.txt"
-        f_out = open(out_path, "w", encoding="utf-8")
-        local["chunks_written"] += 1
-
-        with open(abs_in_path, "r", encoding="utf-8", errors="ignore") as f_in:
+        # Open staging file (binary, exact bytes)
+        with open(abs_in_path, "rb") as f_in, open(local["staging_file"], "wb") as f_stage:
             for line in f_in:
                 local["lines_processed"] += 1
                 try:
                     cur.execute("INSERT OR IGNORE INTO lines(line) VALUES (?)", (line,))
                     if cur.rowcount == 1:
-                        f_out.write(line)
+                        f_stage.write(line)          # write unique line to staging
                         local["unique_kept"] += 1
-                        line_in_chunk += 1
                         pending += 1
-
-                        if line_in_chunk >= CHUNK_SIZE:
-                            f_out.close()
-                            chunk_idx += 1
-                            out_path = out_dir / f"{Path(rel_path).stem}_part{chunk_idx}.txt"
-                            f_out = open(out_path, "w", encoding="utf-8")
-                            local["chunks_written"] += 1
-                            line_in_chunk = 0
-
                     else:
                         local["duplicates_removed"] += 1
 
@@ -114,25 +102,25 @@ def process_file(args: Tuple[str, str, str]) -> Dict[str, object]:
                         pending = 0
 
                 except sqlite3.OperationalError:
+                    # Commit & retry once on lock/busy
                     conn.commit()
                     cur.execute("BEGIN;")
                     cur.execute("INSERT OR IGNORE INTO lines(line) VALUES (?)", (line,))
                     if cur.rowcount == 1:
-                        f_out.write(line)
+                        f_stage.write(line)
                         local["unique_kept"] += 1
-                        line_in_chunk += 1
                     else:
                         local["duplicates_removed"] += 1
 
-        f_out.close()
         conn.commit()
         cur.close()
         conn.close()
 
     except Exception as e:
+        # Remove partial staging so the file can be retried safely
         try:
-            if "f_out" in locals() and not f_out.closed:
-                f_out.close()
+            if os.path.exists(local["staging_file"]):
+                os.remove(local["staging_file"])
         except Exception:
             pass
         err = f"{rel_path}: {e.__class__.__name__}: {e}"
@@ -155,21 +143,82 @@ def append_completed(log_path: str, rel_path: str):
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(rel_path + "\n")
 
-def write_summary(summary):
+def _purge_old_chunks():
+    # Remove existing chunkNNNN.txt so merge is idempotent
+    if not os.path.isdir(OUTPUT_FOLDER):
+        return
+    for p in Path(OUTPUT_FOLDER).glob("chunk*.txt"):
+        try: p.unlink()
+        except Exception: pass
+
+def perform_merge(summary: Dict[str, object]) -> None:
+    """
+    Merge all staging files (sorted by corresponding rel_path filename)
+    into flat chunkNNNN.txt files with CHUNK_SIZE lines each.
+    """
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    _purge_old_chunks()
+
+    staging_files = sorted(Path(STAGING_DIR).glob("*.stage"))
+    if not staging_files:
+        return
+
+    chunk_idx = 1
+    lines_in_chunk = 0
+    f_out: Optional[object] = None
+
+    def open_new_chunk(idx: int):
+        path = Path(OUTPUT_FOLDER) / f"chunk{idx:04d}.txt"
+        return open(path, "wb"), path
+
+    try:
+        for sfile in staging_files:
+            with open(sfile, "rb") as fin:
+                for line in fin:
+                    # create first chunk lazily
+                    if f_out is None:
+                        f_out, _ = open_new_chunk(chunk_idx)
+                        summary["total_chunks_written"] += 1
+                        lines_in_chunk = 0
+
+                    f_out.write(line)
+                    lines_in_chunk += 1
+
+                    if lines_in_chunk >= CHUNK_SIZE:
+                        f_out.close()
+                        chunk_idx += 1
+                        f_out, _ = open_new_chunk(chunk_idx)
+                        summary["total_chunks_written"] += 1
+                        lines_in_chunk = 0
+        if f_out is not None and not f_out.closed:
+            f_out.close()
+    finally:
+        # cleanup staging
+        for sfile in staging_files:
+            try: sfile.unlink()
+            except Exception: pass
+        # Optionally remove empty staging dir
+        try:
+            if not any(Path(STAGING_DIR).iterdir()):
+                Path(STAGING_DIR).rmdir()
+        except Exception:
+            pass
+
+def write_summary(summary: Dict[str, object]) -> None:
     summary["end_ts"] = time.time()
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"Global Dedup with Chunking - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Global Dedup → Flat Chunking - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Input Folder:  {os.path.abspath(INPUT_FOLDER)}\n")
         f.write(f"Output Folder: {os.path.abspath(OUTPUT_FOLDER)}\n")
         f.write(f"Chunk Size:    {CHUNK_SIZE}\n")
-        f.write(f"Index DB:      {os.path.abspath(DEDUP_DB)}\n")
+        f.write(f"Index DB:      {os.path.abspath(DEDUP_DB)} (default journaling, no WAL)\n")
         f.write(f"Max Workers:   {summary['max_workers']}\n\n")
 
         f.write("=== Files ===\n")
-        f.write(f"Discovered: {summary['files_discovered']}\n")
-        f.write(f"Processed:  {summary['files_scanned']}\n")
-        f.write(f"Success:    {summary['files_success']}\n")
-        f.write(f"Errors:     {summary['files_error']}\n\n")
+        f.write(f"Discovered (recursive): {summary['files_discovered']}\n")
+        f.write(f"Processed:              {summary['files_scanned']}\n")
+        f.write(f"Success:                {summary['files_success']}\n")
+        f.write(f"Errors:                 {summary['files_error']}\n\n")
 
         f.write("=== Lines ===\n")
         f.write(f"Total processed:         {summary['total_lines_processed']}\n")
@@ -190,6 +239,7 @@ def main():
         sys.exit(1)
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    os.makedirs(STAGING_DIR, exist_ok=True)
     _init_db(DEDUP_DB)
 
     all_files = find_all_txt_files(INPUT_FOLDER)
@@ -201,25 +251,29 @@ def main():
     pending = [(abs_p, rel_p) for (abs_p, rel_p) in all_files if rel_p not in completed]
 
     if not pending:
-        print("All files already processed per resume log.")
+        print("All files already processed per resume log. Proceeding to merge if staging exists...")
+        # If staging files exist (previous run interrupted before merge), merge them now.
+        summary = {
+            "start_ts": time.time(), "end_ts": None, "max_workers": MAX_WORKERS,
+            "files_discovered": len(all_files), "files_scanned": 0,
+            "files_success": 0, "files_error": 0,
+            "total_lines_processed": 0, "total_unique_kept": 0,
+            "total_duplicates_removed": 0, "total_chunks_written": 0, "errors": []
+        }
+        perform_merge(summary)
+        write_summary(summary)
         return
 
     summary = {
-        "start_ts": time.time(),
-        "end_ts": None,
-        "max_workers": MAX_WORKERS,
-        "files_discovered": len(all_files),
-        "files_scanned": 0,
-        "files_success": 0,
-        "files_error": 0,
-        "total_lines_processed": 0,
-        "total_unique_kept": 0,
-        "total_duplicates_removed": 0,
-        "total_chunks_written": 0,
+        "start_ts": time.time(), "end_ts": None, "max_workers": MAX_WORKERS,
+        "files_discovered": len(all_files), "files_scanned": 0,
+        "files_success": 0, "files_error": 0,
+        "total_lines_processed": 0, "total_unique_kept": 0,
+        "total_duplicates_removed": 0, "total_chunks_written": 0,
         "errors": []
     }
 
-    overall_bar = tqdm(total=len(pending), desc="Overall", unit="file", leave=True)
+    overall_bar = tqdm(total=len(pending), desc="Stage 1/2: Dedup → staging", unit="file", leave=True)
 
     try:
         work_args = [(abs_p, rel_p, DEDUP_DB) for (abs_p, rel_p) in pending]
@@ -230,10 +284,9 @@ def main():
                 try:
                     res = fut.result()
                     summary["files_scanned"] += 1
-                    summary["total_lines_processed"] += res["lines_processed"]
-                    summary["total_unique_kept"] += res["unique_kept"]
-                    summary["total_duplicates_removed"] += res["duplicates_removed"]
-                    summary["total_chunks_written"] += res.get("chunks_written", 0)
+                    summary["total_lines_processed"] += int(res["lines_processed"])
+                    summary["total_unique_kept"] += int(res["unique_kept"])
+                    summary["total_duplicates_removed"] += int(res["duplicates_removed"])
 
                     if res["error"]:
                         summary["files_error"] += 1
@@ -256,7 +309,11 @@ def main():
 
     finally:
         overall_bar.close()
-        write_summary(summary)
+
+    # Stage 2: Merge staging → flat chunkNNNN.txt
+    tqdm.write("Stage 2/2: Merging staging → chunkNNNN.txt ...")
+    perform_merge(summary)
+    write_summary(summary)
 
 if __name__ == "__main__":
     main()
