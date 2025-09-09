@@ -4,6 +4,7 @@ import re
 import sys
 import json
 import uuid
+import argparse
 import traceback
 import threading
 import time
@@ -15,12 +16,12 @@ from datetime import datetime
 from collections import defaultdict
 from tqdm import tqdm
 
-# ============= CONFIG ============= #
+# ============= DEFAULT CONFIG ============= #
 INPUT_FOLDER    = "input_logs"              # put your input folder name here (in current dir)
 OUTPUT_FOLDER   = "output_mobile_regex"     # outputs will be created under this
 MAX_WORKERS     = 6
 CHUNK_SIZE      = 10_000                    # rotate output files every 10k lines
-MIRROR_TRUNCATE = 1500                      # first N chars of log_line kept (now used for BOTH extracted & mirror)
+MIRROR_TRUNCATE = 1500                      # first N chars of log_line kept (used for BOTH extracted & mirror)
 SUMMARY_REFRESH_INTERVAL = 30               # seconds (live summary rewrite)
 RESUME_LOG      = Path(OUTPUT_FOLDER) / "resume_files.log"   # tracks successfully processed files
 
@@ -29,11 +30,12 @@ NESTED_JSON_DETECT   = True
 FIELD_PATH_MODE      = "full"               # "last" or "full"
 JSON_BACKSCAN_WINDOW = 800
 
-# Stats shard safety knobs
+# Stats shard knobs
 EXAMPLE_MAXLEN  = 500                       # limit example string length in stats shards
 PATH_ONLY_MAX   = 5                         # per-file cap for path-only sample lines
-# ================================== #
+# ========================================== #
 
+# Derived paths
 OUT_FIELDS_DIR     = Path(OUTPUT_FOLDER) / "fields_identified"
 OUT_MIRROR_DIR     = Path(OUTPUT_FOLDER) / "mirror"
 OUT_FIELDS_SHARDS  = OUT_FIELDS_DIR / "shards"
@@ -47,37 +49,30 @@ MOBILE_RE = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
 
 # ---------- field detection patterns ----------
 def make_patterns(value_escaped: str):
-    # 1) JSON-quoted keys: "mobile":"987..." or 'phone' : 987...
     p_json_quoted = re.compile(
         rf'["\']\s*(?P<field>[^"\']+?)\s*["\']\s*[:=]\s*["\']?(?P<value>{value_escaped})["\']?',
         re.IGNORECASE,
     )
-    # 2) Key:Value / Key=Value
     p_kv = re.compile(
         rf'\b(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*["\']?(?P<value>{value_escaped})["\']?',
         re.IGNORECASE,
     )
-    # 3) XML attribute: <tag field="987...">
     p_xml_attr = re.compile(
         rf'<[^>]*\b(?P<field>[A-Za-z0-9_.\-]+)\s*=\s*["\'](?P<value>{value_escaped})["\'][^>]*>',
         re.IGNORECASE | re.DOTALL,
     )
-    # 4) XML tag content: <field>987...</field>
     p_xml_tag = re.compile(
         rf'<\s*(?P<field>[A-Za-z0-9_.\-]+)[^>]*>[^<]*?(?P<value>{value_escaped})[^<]*?</\s*\1\s*>',
         re.IGNORECASE | re.DOTALL,
     )
-    # 5) Bracketed keys: [MobileNo: 987...] or [Phone=987...]
     p_bracketed = re.compile(
         rf'\[\s*(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<value>{value_escaped})\s*\]',
         re.IGNORECASE,
     )
-    # 6a) Curly fragments: {custId=123, phone=987...}
     p_curly = re.compile(
         rf'\{{[^}}]*?(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<value>{value_escaped})(?:[^}}]*?)\}}',
         re.IGNORECASE,
     )
-    # 6b) XML inline: <field name=mobile>987...</field>
     p_xml_inline = re.compile(
         rf'<[^>]*?\bname\s*=\s*["\']?(?P<field>[A-Za-z0-9_.\-]+)["\']?[^>]*>'
         rf'[^<]*?(?P<value>{value_escaped})[^<]*?</[^>]+>',
@@ -123,7 +118,6 @@ def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_
         k = m.group('k').strip()
         key_depth = lvl[m.start()]
         candidates.append((m.start(), m.end(), key_depth, k))
-
     if not candidates:
         return None
 
@@ -148,7 +142,7 @@ def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_
     if path_mode == "last":
         return best_key
 
-    # dotted path
+    # dotted path from nearest upwards
     path = [best_key]
     target_depth = best_key_depth
     for start_idx, after_colon, key_depth, key in reversed(candidates):
@@ -179,7 +173,7 @@ def identify_field_for_value(log_line: str, value: str):
 # ---------------- per-worker shard writer ----------------
 class ShardWriter:
     """
-    Each worker writes directly to final shard files (no IPC for data).
+    Each worker writes directly to shard files (no IPC for data).
     Files rotate after CHUNK_SIZE lines.
     """
     def __init__(self, base_dir: Path, prefix: str, pid: int, chunk_size: int):
@@ -227,7 +221,8 @@ class ShardWriter:
 def _safe_trunc(s: str, n: int) -> str:
     return s if len(s) <= n else (s[:n] + "...TRUNCATED...")
 
-def write_stats_shard(input_path: Path,
+def write_stats_shard(run_id: str,
+                      input_path: Path,
                       stats: dict,
                       per_field_counts: dict,
                       per_field_example: dict,
@@ -237,19 +232,20 @@ def write_stats_shard(input_path: Path,
     """
     STATS_SHARDS_DIR.mkdir(parents=True, exist_ok=True)
     rec = {
+        "run_id": run_id,
         "input_path": str(input_path),
         "timestamp": datetime.now().isoformat(timespec='seconds'),
-        "stats": stats,  # totals for this file
-        "per_field_counts": per_field_counts,  # full counts
+        "stats": stats,  # totals for this file (dedup-aware)
+        "per_field_counts": per_field_counts,
         "per_field_example": {k: _safe_trunc(v, EXAMPLE_MAXLEN) for k, v in per_field_example.items()},
         "path_only_samples": [_safe_trunc(x, EXAMPLE_MAXLEN) for x in path_only_samples[:PATH_ONLY_MAX]],
     }
-    fname = f"stats_{os.getpid()}_{uuid.uuid4().hex}.jsonl"
+    fname = f"stats_{run_id}_{os.getpid()}_{uuid.uuid4().hex}.jsonl"
     with (STATS_SHARDS_DIR / fname).open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 # ---------------- worker ----------------
-def process_file(path: Path):
+def process_file(path: Path, run_id: str):
     """
     Workers write directly to shard files and emit a small stats shard.
     Returns: (file_failed: bool, path_str: str, disk_full: bool)
@@ -295,55 +291,49 @@ def process_file(path: Path):
                         path_only_samples.append(line)
                     continue
 
-                # -------- per-line de-dup by field --------
-                # Map field -> first mobile value encountered on this line
+                # Per-line de-dup by field
                 field_first_value = {}
                 unidentified_present = False
 
-                # Identify fields for all matches in the log part
                 for m in log_matches:
                     mobile_val = m.group(0)
                     field = identify_field_for_value(log_line, mobile_val)
                     if field:
-                        if field not in field_first_value:
-                            field_first_value[field] = mobile_val
+                        key_norm = field.strip().lower()
+                        if key_norm not in field_first_value:
+                            field_first_value[key_norm] = (field, mobile_val)
                     else:
                         unidentified_present = True
 
-                # If nothing to emit, move on
                 if not field_first_value and not unidentified_present:
                     continue
 
-                # Prepare truncated log once (applies to BOTH extracted & mirror)
                 short_log = log_line if len(log_line) <= MIRROR_TRUNCATE else (log_line[:MIRROR_TRUNCATE] + "...TRUNCATED...")
 
-                # Emit at most one extracted row per unique field on this line
+                # Emit one extracted row per unique field
                 had_extr = False
-                for field, mob in field_first_value.items():
+                for _, (field, mob) in field_first_value.items():
                     row = f"{short_log} ; {file_path} ; {field} ; mobile_regex ; {mob}\n"
                     fields_writer.write(row)
-                    stats["extracted_matches"] += 1
+                    stats["extracted_rows"] += 1
                     per_field_counts[field] += 1
                     if field not in per_field_example:
                         per_field_example[field] = row.strip()
                     had_extr = True
 
-                # Emit at most one mirror row for unidentified (if any)
+                # Emit at most one mirror row if any unidentified occurred
                 had_mirr = False
                 if unidentified_present:
-                    # We don't know which mobile, but keep the first mobile in the line to show evidence
-                    # Find first log match and use it
                     first_mob = log_matches[0].group(0)
                     row = f"{short_log} ; {file_path} ; UNIDENTIFIED_FIELD ; mobile_regex ; {first_mob}\n"
                     mirror_writer.write(row)
-                    stats["mirrored_matches"] += 1
+                    stats["mirror_rows"] += 1
                     had_mirr = True
 
                 if had_extr and had_mirr:
                     stats["partial_valid_lines"] += 1
 
     except OSError as e:
-        # Disk full or other OS error while writing
         file_failed = True
         if getattr(e, "errno", None) == 28:
             disk_full = True
@@ -364,7 +354,7 @@ def process_file(path: Path):
         except Exception:
             pass
 
-    # Close writers and emit stats shard
+    # Close writers & emit stats shard
     try:
         fields_writer.close()
         mirror_writer.close()
@@ -381,9 +371,8 @@ def process_file(path: Path):
             pass
 
     try:
-        write_stats_shard(path, dict(stats), dict(per_field_counts), per_field_example, path_only_samples)
+        write_stats_shard(run_id, path, dict(stats), dict(per_field_counts), per_field_example, path_only_samples)
     except Exception as e:
-        # stats shard failure should not crash worker
         try:
             with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
                 ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] stats_shard_write {path}: {e}\n")
@@ -393,71 +382,10 @@ def process_file(path: Path):
 
     return (file_failed, str(path), disk_full)
 
-# ---------------- merge shards ----------------
-def merge_shards(shard_dir: Path, out_dir: Path, prefix: str, chunk_size: int):
+# ---------------- reduce stats shards (RUN_ID aware) ----------------
+def reduce_stats_shards(run_id: str):
     """
-    Streaming merge of all shard files into numbered outputs rotated at chunk_size lines.
-    Shards are deleted after successful merge.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    shards = sorted([p for p in shard_dir.glob(f"{prefix}_pid*_*.txt") if p.is_file()])
-    if not shards:
-        try:
-            if shard_dir.exists():
-                for _ in shard_dir.iterdir():
-                    break
-                else:
-                    shard_dir.rmdir()
-        except Exception:
-            pass
-        return
-
-    file_index = 1
-    lines_written = 0
-    out_fh = (out_dir / f"{prefix}_{file_index:03d}.txt").open("w", encoding="utf-8")
-    try:
-        for shard in shards:
-            with shard.open("r", encoding="utf-8", errors="ignore") as sf:
-                for line in sf:
-                    try:
-                        out_fh.write(line)
-                    except OSError as e:
-                        if getattr(e, "errno", None) == 28:
-                            raise
-                        else:
-                            raise
-                    lines_written += 1
-                    if lines_written >= chunk_size:
-                        out_fh.close()
-                        file_index += 1
-                        lines_written = 0
-                        out_fh = (out_dir / f"{prefix}_{file_index:03d}.txt").open("w", encoding="utf-8")
-        out_fh.close()
-    finally:
-        try:
-            if not out_fh.closed:
-                out_fh.close()
-        except Exception:
-            pass
-
-    # Cleanup shards
-    try:
-        for shard in shards:
-            try:
-                shard.unlink()
-            except Exception:
-                pass
-        try:
-            next(shard_dir.iterdir())
-        except StopIteration:
-            shard_dir.rmdir()
-    except Exception:
-        pass
-
-# ---------------- reduce stats shards ----------------
-def reduce_stats_shards():
-    """
-    Aggregate all per-file JSONL stats shards into global counters, per-field counts, examples, and samples.
+    Aggregate all per-file JSONL stats shards for this run_id into global counters, per-field counts, examples, and samples.
     Returns: (G_stats, G_field_counts, G_field_example, G_path_only_samples)
     """
     G_stats = defaultdict(int)
@@ -468,7 +396,7 @@ def reduce_stats_shards():
     if not STATS_SHARDS_DIR.exists():
         return G_stats, G_field_counts, G_field_example, G_path_only_samples
 
-    shards = sorted([p for p in STATS_SHARDS_DIR.glob("stats_*.jsonl") if p.is_file()])
+    shards = sorted([p for p in STATS_SHARDS_DIR.glob(f"stats_{run_id}_*.jsonl") if p.is_file()])
     for shard in shards:
         try:
             with shard.open("r", encoding="utf-8", errors="ignore") as fh:
@@ -476,6 +404,8 @@ def reduce_stats_shards():
                     if not line.strip():
                         continue
                     rec = json.loads(line)
+                    if rec.get("run_id") != run_id:
+                        continue
                     stats = rec.get("stats", {})
                     for k, v in stats.items():
                         try:
@@ -509,8 +439,9 @@ def reduce_stats_shards():
 
     return G_stats, G_field_counts, G_field_example, G_path_only_samples
 
-# ---------------- summary writer ----------------
+# ---------------- summary writer (dedup-aware) ----------------
 def write_summary(input_dir: Path,
+                  run_id: str,
                   G_stats: dict,
                   G_field_counts: dict,
                   G_field_example: dict,
@@ -520,18 +451,16 @@ def write_summary(input_dir: Path,
                   files_total: int = 0,
                   files_processed: int = 0,
                   files_failed: int = 0):
-    total_matches     = G_stats.get("total_regex_matches", 0)
-    extracted_matches = G_stats.get("extracted_matches", 0)
-    mirrored_matches  = G_stats.get("mirrored_matches", 0)
-    dropped_path_only = G_stats.get("dropped_path_only_matches", 0)
-    lines_no_regex    = G_stats.get("lines_no_regex", 0)
-    errors_count      = G_stats.get("errors", 0)
-    partial_lines     = G_stats.get("partial_valid_lines", 0)
-
-    consistency_ok = (extracted_matches + mirrored_matches + dropped_path_only) == total_matches
+    raw_total     = G_stats.get("total_regex_matches", 0)
+    dropped_path  = G_stats.get("dropped_path_only_matches", 0)
+    lines_no_regex= G_stats.get("lines_no_regex", 0)
+    extr_rows     = G_stats.get("extracted_rows", 0)  # dedup output rows
+    mirr_rows     = G_stats.get("mirror_rows", 0)     # dedup output rows
+    partial_lines = G_stats.get("partial_valid_lines", 0)
+    errors_count  = G_stats.get("errors", 0)
 
     with open(SUMMARY_FILE, "w", encoding="utf-8") as sf:
-        sf.write(f"Summary ({stage}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        sf.write(f"Summary ({stage}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | RUN_ID={run_id}\n")
         sf.write("=" * 60 + "\n\n")
 
         sf.write("INPUT / OUTPUT\n")
@@ -539,7 +468,7 @@ def write_summary(input_dir: Path,
         sf.write(f"Output folder: {Path(OUTPUT_FOLDER).resolve()}\n")
         sf.write(f"Fields Identified (chunk size {CHUNK_SIZE}): {OUT_FIELDS_DIR.resolve()}\n")
         sf.write(f"Mirror (chunk size {CHUNK_SIZE}): {OUT_MIRROR_DIR.resolve()}\n")
-        sf.write(f"Mirror truncation: first {MIRROR_TRUNCATE} chars of log_line\n\n")
+        sf.write(f"Truncation: first {MIRROR_TRUNCATE} chars of log_line (applies to extracted & mirror)\n\n")
 
         sf.write("FILE COUNTS\n")
         sf.write(f"Total files discovered: {files_total}\n")
@@ -552,15 +481,15 @@ def write_summary(input_dir: Path,
                 sf.write(f"- {f}\n")
             sf.write("\n")
 
-        sf.write("COUNTS\n")
-        sf.write(f"Total regex matches: {total_matches}\n")
-        sf.write(f"  Extracted matches: {extracted_matches}\n")
-        sf.write(f"  Mirrored matches:  {mirrored_matches}\n")
-        sf.write(f"  Dropped (path-only matches): {dropped_path_only}\n")
-        sf.write(f"Lines with no regex at all (dropped lines): {lines_no_regex}\n")
+        sf.write("COUNTS (raw vs output rows)\n")
+        sf.write(f"Raw regex matches (log+path): {raw_total}\n")
+        sf.write(f"  Dropped (path-only matches): {dropped_path}\n")
+        sf.write(f"  Lines with no regex (dropped lines): {lines_no_regex}\n")
+        sf.write(f"Output rows (dedup):\n")
+        sf.write(f"  Extracted rows: {extr_rows}\n")
+        sf.write(f"  Mirror rows:    {mirr_rows}\n")
         sf.write(f"Partial-valid lines: {partial_lines}\n")
-        sf.write(f"Errors: {errors_count}\n")
-        sf.write(f"Consistency check: {consistency_ok}\n\n")
+        sf.write(f"Errors: {errors_count}\n\n")
 
         sf.write("PER-FIELD COUNTS (extracted)\n")
         for fld, cnt in sorted(G_field_counts.items(), key=lambda kv: kv[0].lower()):
@@ -579,11 +508,10 @@ def write_summary(input_dir: Path,
         sf.write("\n")
 
         sf.write("NOTES\n")
-        sf.write("- Extraction strictly on allowed field→value patterns (incl. brackets/curly/XML-inline).\n")
-        sf.write("- Nested-JSON key-path inference enabled; returns dotted paths.\n")
         sf.write("- Per-line de-dup by field: at most one extracted row per unique field per line.\n")
         sf.write("- One mirror row per line if any unidentified field present.\n")
-        sf.write("- Mirror & extracted rows truncate log_line to first 1500 chars.\n")
+        sf.write("- Nested-JSON key-path inference enabled; returns dotted paths.\n")
+        sf.write("- Summary counts are for this RUN_ID only.\n")
 
 # ---------------- resume helpers ----------------
 def load_resume_set() -> set:
@@ -602,18 +530,19 @@ def append_resume(path_str: str):
     except Exception:
         pass
 
-# ---------------- live summary refresher (reads shards safely) ----------------
+# ---------------- live summary refresher ----------------
 def summary_refresher_loop(input_dir: Path,
+                           run_id: str,
                            files_total_getter,
                            files_progress_getter,
                            failed_files_getter,
                            stop_event: threading.Event):
     while not stop_event.is_set():
         try:
-            G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards()
+            G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards(run_id)
             files_total, files_processed, files_failed = files_total_getter(), *files_progress_getter()
             failed_files = failed_files_getter()
-            write_summary(input_dir, G_stats, G_field_counts, G_field_example,
+            write_summary(input_dir, run_id, G_stats, G_field_counts, G_field_example,
                           G_path_only_samples, failed_files, stage="Live",
                           files_total=files_total, files_processed=files_processed, files_failed=files_failed)
         except Exception as e:
@@ -625,8 +554,93 @@ def summary_refresher_loop(input_dir: Path,
                 pass
         stop_event.wait(SUMMARY_REFRESH_INTERVAL)
 
-# ---------------- main ----------------
+# ---------------- merge shards (direct, verified) ----------------
+def merge_shards_and_verify(run_id: str) -> bool:
+    """
+    Merge shards directly into final files (10k lines each), then verify counts against stats reducer.
+    Only delete shards if counts match. Return True on success (deleted), False if kept.
+    """
+    def _merge_one(shard_dir: Path, out_dir: Path, prefix: str, expected_lines: int) -> int:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        shards = sorted([p for p in shard_dir.glob(f"{prefix}_pid*_*.txt") if p.is_file()])
+        total_written = 0
+        if not shards:
+            return 0
+        file_index = 1
+        lines_written = 0
+        out_fh = (out_dir / f"{prefix}_{file_index:03d}.txt").open("w", encoding="utf-8")
+        try:
+            for shard in shards:
+                with shard.open("r", encoding="utf-8", errors="ignore") as sf:
+                    for line in sf:
+                        out_fh.write(line)
+                        lines_written += 1
+                        total_written += 1
+                        if lines_written >= CHUNK_SIZE:
+                            out_fh.close()
+                            file_index += 1
+                            lines_written = 0
+                            out_fh = (out_dir / f"{prefix}_{file_index:03d}.txt").open("w", encoding="utf-8")
+            out_fh.close()
+        finally:
+            try:
+                if not out_fh.closed:
+                    out_fh.close()
+            except Exception:
+                pass
+        return total_written
+
+    # Reduce expected counts first
+    G_stats, *_ = reduce_stats_shards(run_id)
+    expected_extracted = int(G_stats.get("extracted_rows", 0))
+    expected_mirror    = int(G_stats.get("mirror_rows", 0))
+
+    # Merge directly
+    wrote_extracted = _merge_one(OUT_FIELDS_SHARDS, OUT_FIELDS_DIR, "extracted", expected_extracted)
+    wrote_mirror    = _merge_one(OUT_MIRROR_SHARDS, OUT_MIRROR_DIR, "mirror", expected_mirror)
+
+    # Verify
+    ok = (wrote_extracted == expected_extracted) and (wrote_mirror == expected_mirror)
+
+    # Delete shards only if counts match
+    if ok:
+        for d in (OUT_FIELDS_SHARDS, OUT_MIRROR_SHARDS):
+            if d.exists():
+                for p in list(d.glob("*")):
+                    try: p.unlink()
+                    except Exception: pass
+                try:
+                    next(d.iterdir())
+                except StopIteration:
+                    try: d.rmdir()
+                    except Exception: pass
+    else:
+        # Keep shards for merge-only retry; log a warning
+        try:
+            with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
+                ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] merge_verify_mismatch: "
+                         f"expected extracted={expected_extracted}, mirror={expected_mirror}; "
+                         f"wrote extracted={wrote_extracted}, mirror={wrote_mirror}\n")
+        except Exception:
+            pass
+
+    return ok
+
+# ---------------- CLI / main ----------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Mobile extractor with dedup + verified merge")
+    ap.add_argument("--merge-only", action="store_true",
+                    help="Only merge shards and write summary (no processing)")
+    ap.add_argument("--keep-stats", action="store_true",
+                    help="Do not clean _stats_shards at start")
+    ap.add_argument("--run-id", type=str, default=None,
+                    help="Override RUN_ID (advanced). Default: generate new UUID on processing; "
+                         "in --merge-only, you must pass the correct RUN_ID for the shards you want to merge.")
+    return ap.parse_args()
+
 def main():
+    args = parse_args()
+
     input_dir = Path(INPUT_FOLDER)
     if not input_dir.exists():
         print(f"Input folder not found: {input_dir.resolve()}")
@@ -640,14 +654,45 @@ def main():
     OUT_MIRROR_SHARDS.mkdir(parents=True, exist_ok=True)
     STATS_SHARDS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # RUN_ID handling
+    if args.merge_only:
+        if not args.run_id:
+            print("--merge-only requires --run-id matching the shards to merge.")
+            sys.exit(1)
+        run_id = args.run_id
+    else:
+        run_id = args.run_id or uuid.uuid4().hex
+
+    # Clean stats shards at start unless told not to (only for processing runs)
+    if not args.merge_only and not args.keep_stats:
+        # remove any old stats_* files to prevent cross-run contamination
+        try:
+            for p in STATS_SHARDS_DIR.glob("stats_*.jsonl"):
+                try: p.unlink()
+                except Exception: pass
+        except Exception:
+            pass
+
     # Discover files
     files = [p for p in input_dir.rglob("*.txt")]
-    if not files:
+    if not files and not args.merge_only:
         print("No .txt files found in input.")
-        G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards()
-        write_summary(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, [], stage="Final",
-                      files_total=0, files_processed=0, files_failed=0)
+        G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards(run_id)
+        write_summary(input_dir, run_id, G_stats, G_field_counts, G_field_example, G_path_only_samples, [],
+                      stage="Final", files_total=0, files_processed=0, files_failed=0)
         sys.exit(0)
+
+    if args.merge_only:
+        ok = merge_shards_and_verify(run_id)
+        G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards(run_id)
+        write_summary(input_dir, run_id, G_stats, G_field_counts, G_field_example,
+                      G_path_only_samples, [], stage=("Final" if ok else "Merge Mismatch"),
+                      files_total=len(files), files_processed=len(files), files_failed=0)
+        print("\n✅ Merge-only complete." if ok else "\n⚠️  Merge-only finished with mismatch; shards preserved.")
+        print(f"Summary: {SUMMARY_FILE.resolve()}")
+        if not ok:
+            print("Check errors.log for details. You can re-run --merge-only after investigating.")
+        return
 
     already = load_resume_set()
     pending = [p for p in files if str(p) not in already]
@@ -658,12 +703,13 @@ def main():
     failed_files = []
     disk_full_detected = False
 
-    # Live summary refresher (reads shards to populate counts)
+    # Live summary refresher
     stop_event = threading.Event()
     refresher = threading.Thread(
         target=summary_refresher_loop,
         args=(
             input_dir,
+            run_id,
             lambda: files_total,
             lambda: (files_processed, len(failed_files)),
             lambda: failed_files,
@@ -677,7 +723,7 @@ def main():
 
     try:
         with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as ex:
-            futures = {ex.submit(process_file, p): p for p in pending}
+            futures = {ex.submit(process_file, p, run_id): p for p in pending}
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
                 path = futures[fut]
                 try:
@@ -690,7 +736,6 @@ def main():
                         files_processed += 1
                         append_resume(path_str)
                     if disk_full_detected:
-                        # Abort further processing promptly
                         break
                 except KeyboardInterrupt:
                     raise
@@ -711,8 +756,8 @@ def main():
 
         if disk_full_detected:
             # Do NOT merge; write aborted summary and exit.
-            G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards()
-            write_summary(input_dir, G_stats, G_field_counts, G_field_example,
+            G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards(run_id)
+            write_summary(input_dir, run_id, G_stats, G_field_counts, G_field_example,
                           G_path_only_samples, failed_files, stage="Aborted (Disk Full)",
                           files_total=files_total, files_processed=files_processed, files_failed=len(failed_files))
             print("\n❌ Aborted: No space left on device. Free disk space and re-run to resume.")
@@ -720,43 +765,26 @@ def main():
             print(f"Errors logged:      {ERRORS_FILE.resolve()}")
             sys.exit(2)
 
-        # Merge shards into final rotated outputs (exactly 10k lines per file)
-        try:
-            merge_shards(OUT_FIELDS_SHARDS, OUT_FIELDS_DIR, "extracted", CHUNK_SIZE)
-            merge_shards(OUT_MIRROR_SHARDS, OUT_MIRROR_DIR, "mirror", CHUNK_SIZE)
-        except OSError as e:
-            if getattr(e, "errno", None) == 28:
-                # Disk full during merge — write summary and abort
-                G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards()
-                write_summary(input_dir, G_stats, G_field_counts, G_field_example,
-                              G_path_only_samples, failed_files, stage="Aborted (Disk Full during merge)",
-                              files_total=files_total, files_processed=files_processed, files_failed=len(failed_files))
-                print("\n❌ Aborted during merge: No space left on device. Free space and re-run to resume/merge.")
-                print(f"Summary:            {SUMMARY_FILE.resolve()}")
-                print(f"Errors logged:      {ERRORS_FILE.resolve()}")
-                sys.exit(3)
-            else:
-                raise
-        except Exception as e:
-            try:
-                with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
-                    ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] merge_shards: {e}\n")
-                    ef.write(traceback.format_exc() + "\n")
-            except Exception:
-                pass
+        # Merge shards directly to final files and verify counts
+        ok = merge_shards_and_verify(run_id)
 
         # Final reduce for summary
-        G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards()
-        write_summary(input_dir, G_stats, G_field_counts, G_field_example,
-                      G_path_only_samples, failed_files, stage="Final",
+        G_stats, G_field_counts, G_field_example, G_path_only_samples = reduce_stats_shards(run_id)
+        stage = "Final" if ok else "Merge Mismatch (Shards Kept)"
+        write_summary(input_dir, run_id, G_stats, G_field_counts, G_field_example,
+                      G_path_only_samples, failed_files, stage=stage,
                       files_total=files_total, files_processed=files_processed, files_failed=len(failed_files))
 
-        print("\n✅ Done.")
+        if ok:
+            print("\n✅ Done.")
+        else:
+            print("\n⚠️  Done with merge verification MISMATCH. Shards preserved for retry (--merge-only --run-id YOUR_RUN_ID).")
+        print(f"RUN_ID:             {run_id}")
         print(f"Total files: {files_total}  |  Processed: {files_processed}  |  Failed: {len(failed_files)}")
         print(f"Extracted files in: {OUT_FIELDS_DIR.resolve()}")
         print(f"Mirror files in:    {OUT_MIRROR_DIR.resolve()}")
         print(f"Summary:            {SUMMARY_FILE.resolve()}")
-        if failed_files:
+        if failed_files or not ok:
             print(f"Errors logged:      {ERRORS_FILE.resolve()}")
 
 if __name__ == "__main__":
