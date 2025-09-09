@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Pattern Masker — targeted redaction of values in known log formats
+- Mirrors our standard structure: ProcessPool, resume-safe, nested progress bars, rich summary.
+- Implements 4 cases provided by the user.
+- Preserves original lines and trailing ';path' segments; only masks targeted values.
+"""
+
+import os
+import sys
+import re
+import traceback
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
+from collections import defaultdict
+from typing import Dict, Tuple, List, Optional
+from tqdm import tqdm
+
+# ========= CONFIGURATION ========= #
+INPUT_FOLDER   = "input_logs"           # Folder with .txt inputs (non-recursive)
+OUTPUT_FOLDER  = "cleaned_output"       # Outputs as .txt (same basenames)
+SUMMARY_FILE   = "summary_report.txt"   # Saved in current working dir
+RESUME_LOG     = "resume_files.log"     # Checkpoint log
+MAX_WORKERS    = 6                      # Parallelism
+ALLOWED_EXTS   = (".txt",)              # Process only .txt files
+ENCODING       = "utf-8"                # Input/output encoding
+ERRORS_POLICY  = "ignore"               # "ignore" or "replace" for decode errors
+# ================================= #
+
+# Strict mobile number (India):
+# - either plain 10 digits starting [6-9], or "91" + 10 digits starting [6-9]
+# - forbidden to be embedded in alphanumerics on either side
+MOBILE_REGEX = r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])'
+
+# ----------------- CASE DEFINITIONS -----------------
+# Each case is a compiled regex with a replacement function.
+# We stop at the FIRST case that matches a line (exclusive cases).
+#
+# Case 1:
+# "adding mobileNo in header in device id filter <mobile> , contentId AN739472946284;PATH"
+# -> mask only the contentId value to "xxxx"
+CASE1_PATTERN = re.compile(
+    rf'(?i)(adding\s+mobileNo\s+in\s+header\s+in\s+device\s+id\s+filter)\s+({MOBILE_REGEX})\s*,\s*contentId\s+([A-Za-z0-9_-]+)'
+)
+
+def case1_replace(m: re.Match) -> str:
+    # Keep prefix text and mobile, mask the contentId value (group 3).
+    prefix, mobile, _content = m.group(1), m.group(2), m.group(3)
+    return f"{prefix} {mobile}, contentId xxxx"
+
+# Case 2:
+# "<mobile> and data {count=5} with expiration 685;PATH"
+# -> mask only the expiration number to "xxxx"
+CASE2_PATTERN = re.compile(
+    rf'({MOBILE_REGEX})\s+and\s+data\s*\{{\s*count\s*=\s*\d+\s*\}}\s+with\s+expiration\s+(\d+)',
+    re.IGNORECASE
+)
+
+def case2_replace(m: re.Match) -> str:
+    mobile = m.group(1)
+    return f"{mobile} and data {{count=5}} with expiration xxxx"
+
+# Case 3:
+# "fetching record for : <mobile>_njcd4839...;PATH"
+# -> mask the suffix token after mobile that starts with "_" up to ';' (or end)
+CASE3_PATTERN = re.compile(
+    rf'(?i)(fetching\s+record\s+for\s*:\s*)({MOBILE_REGEX})(_[^; \t\r\n]*)'
+)
+
+def case3_replace(m: re.Match) -> str:
+    prefix, mobile = m.group(1), m.group(2)
+    return f"{prefix}{mobile}xxxx"
+
+# Case 4:
+# "uuidSet expiry for User: <mobile> is: 42601 sec;PATH"
+# -> mask only the seconds number (keep "sec")
+CASE4_PATTERN = re.compile(
+    rf'(?i)(uuidSet\s+expiry\s+for\s+User:\s*)({MOBILE_REGEX})(\s*is:\s*)(\d+)(\s*sec)'
+)
+
+def case4_replace(m: re.Match) -> str:
+    prefix, mobile, is_part, _num, sec = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+    return f"{prefix}{mobile}{is_part}xxxx{sec}"
+
+# Ordered list of cases (first match wins)
+CASES: List[Tuple[str, re.Pattern, callable]] = [
+    ("CASE_1_contentId_mask", CASE1_PATTERN, case1_replace),
+    ("CASE_2_expiration_mask", CASE2_PATTERN, case2_replace),
+    ("CASE_3_suffix_token_mask", CASE3_PATTERN, case3_replace),
+    ("CASE_4_expiry_seconds_mask", CASE4_PATTERN, case4_replace),
+]
+
+# ----------------- CORE LOGIC -----------------
+
+def list_input_files(root: str) -> List[Path]:
+    p = Path(root)
+    if not p.exists():
+        return []
+    files = [x for x in sorted(p.iterdir()) if x.is_file() and x.suffix.lower() in ALLOWED_EXTS]
+    return files
+
+def already_done(file_path: Path) -> bool:
+    # If RESUME_LOG exists and contains the file path, skip it.
+    if not Path(RESUME_LOG).exists():
+        return False
+    try:
+        with open(RESUME_LOG, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip() == str(file_path):
+                    return True
+    except Exception:
+        pass
+    return False
+
+def mark_done(file_path: Path) -> None:
+    try:
+        with open(RESUME_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{file_path}\n")
+    except Exception:
+        pass
+
+def apply_cases(line: str, counters: Dict[str, int]) -> Tuple[str, Optional[str]]:
+    """
+    Try each case in order; on first match, apply mask and return.
+    Returns (new_line, matched_case_name or None).
+    """
+    for case_name, pattern, repl_func in CASES:
+        m = pattern.search(line)
+        if m:
+            new_line = pattern.sub(repl_func, line, count=1)
+            counters[case_name] += 1
+            return new_line, case_name
+    return line, None
+
+def process_file(file_path: Path) -> Dict[str, int]:
+    """
+    Process a single file; returns a dict of local stats.
+    """
+    local = defaultdict(int)
+    local["lines_total"] = 0
+    local["lines_modified"] = 0
+    for case_name, _, _ in CASES:
+        local[case_name] = 0
+
+    out_dir = Path(OUTPUT_FOLDER)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / file_path.name
+
+    try:
+        # Count lines first for a proper inner progress bar
+        try:
+            with open(file_path, "r", encoding=ENCODING, errors=ERRORS_POLICY) as f:
+                for _ in f:
+                    local["lines_total"] += 1
+        except Exception:
+            # Fallback: process without inner bar if counting fails
+            local["lines_total"] = 0
+
+        processed = 0
+        with open(file_path, "r", encoding=ENCODING, errors=ERRORS_POLICY) as fin, \
+             open(out_path, "w", encoding=ENCODING, errors=ERRORS_POLICY) as fout:
+
+            iterator = fin
+            if local["lines_total"] > 0:
+                iterator = tqdm(fin, total=local["lines_total"], desc=f"{file_path.name}", leave=False)
+
+            for line in iterator:
+                original = line.rstrip("\n")
+                modified, matched_case = apply_cases(original, local)
+                if matched_case:
+                    local["lines_modified"] += 1
+                # Always write (we only mask; never drop)
+                fout.write(modified + "\n")
+                processed += 1
+
+        local["status"] = 1
+    except Exception:
+        local["status"] = 0
+        local["error"] = traceback.format_exc()
+
+    return local
+
+def write_summary(summary: Dict[str, any]) -> None:
+    try:
+        with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+            f.write(f"Summary Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Input Folder: {INPUT_FOLDER}\n")
+            f.write(f"Output Folder: {OUTPUT_FOLDER}\n\n")
+
+            f.write(f"Total Files Detected: {summary['files_total']}\n")
+            f.write(f"Total Files Processed: {summary['files_processed']}\n")
+            f.write(f"Total Files Succeeded: {summary['files_succeeded']}\n")
+            f.write(f"Total Files Failed: {summary['files_failed']}\n\n")
+
+            f.write(f"Total Lines Scanned: {summary['lines_total']}\n")
+            f.write(f"Total Lines Modified: {summary['lines_modified']}\n")
+            f.write(f"Total Lines Unchanged: {summary['lines_total'] - summary['lines_modified']}\n\n")
+
+            f.write("Per-Case Match Counts:\n")
+            for case_name in summary["per_case_counts"]:
+                f.write(f"  - {case_name}: {summary['per_case_counts'][case_name]}\n")
+            f.write("\n")
+
+            if summary["errors"]:
+                f.write("Errors:\n")
+                for path, err in summary["errors"]:
+                    f.write(f"  - {path}\n")
+                    f.write("    " + "\n    ".join(err.strip().splitlines()) + "\n")
+    except Exception:
+        # Last resort: print to stderr
+        print("Failed to write summary_report.txt", file=sys.stderr)
+
+def main():
+    Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
+
+    files = list_input_files(INPUT_FOLDER)
+    summary: Dict[str, any] = {
+        "files_total": len(files),
+        "files_processed": 0,
+        "files_succeeded": 0,
+        "files_failed": 0,
+        "lines_total": 0,
+        "lines_modified": 0,
+        "per_case_counts": {name: 0 for name, _, _ in CASES},
+        "errors": [],
+    }
+
+    # Filter out files already completed (resume-safe)
+    todo = [p for p in files if not already_done(p)]
+
+    with tqdm(total=len(todo), desc="Files", leave=True) as pbar:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(process_file, p): p for p in todo}
+            for fut in as_completed(futures):
+                p = futures[fut]
+                summary["files_processed"] += 1
+                pbar.update(1)
+                try:
+                    local = fut.result()
+                    # aggregate
+                    if local.get("status", 0) == 1:
+                        summary["files_succeeded"] += 1
+                        mark_done(p)
+                    else:
+                        summary["files_failed"] += 1
+                        summary["errors"].append((str(p), local.get("error", "Unknown error")))
+                    summary["lines_total"] += local.get("lines_total", 0)
+                    summary["lines_modified"] += local.get("lines_modified", 0)
+                    for case_name in summary["per_case_counts"]:
+                        summary["per_case_counts"][case_name] += local.get(case_name, 0)
+                except Exception:
+                    summary["files_failed"] += 1
+                    summary["errors"].append((str(p), traceback.format_exc()))
+
+    write_summary(summary)
+
+if __name__ == "__main__":
+    main()
