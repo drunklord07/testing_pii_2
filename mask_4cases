@@ -3,7 +3,8 @@
 """
 Pattern Masker — targeted redaction of values in known log formats
 - Mirrors our standard structure: ProcessPool, resume-safe, nested progress bars, rich summary.
-- Implements 4 cases provided by the user.
+- Implements 4 cases, robust to spacing/punctuation.
+- Accepts either literal "<mobile_regex>" OR a real mobile number.
 - Preserves original lines and trailing ';path' segments; only masks targeted values.
 """
 
@@ -29,60 +30,68 @@ ENCODING       = "utf-8"                # Input/output encoding
 ERRORS_POLICY  = "ignore"               # "ignore" or "replace" for decode errors
 # ================================= #
 
-# Strict mobile number (India):
-# - either plain 10 digits starting [6-9], or "91" + 10 digits starting [6-9]
-# - forbidden to be embedded in alphanumerics on either side
-MOBILE_REGEX = r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])'
+# Accept EITHER the literal token "<mobile_regex>" OR a real Indian mobile number.
+MOBILE_LITERAL = r'<mobile_regex>'
+MOBILE_NUMERIC = r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])'
+MOBILE_TOKEN   = r'(?:' + MOBILE_LITERAL + r'|' + MOBILE_NUMERIC + r')'
 
 # ----------------- CASE DEFINITIONS -----------------
-# Each case is a compiled regex with a replacement function.
-# We stop at the FIRST case that matches a line (exclusive cases).
-#
-# Case 1:
-# "adding mobileNo in header in device id filter <mobile> , contentId AN739472946284;PATH"
-# -> mask only the contentId value to "xxxx"
+# Strategy: capture the exact prefix up to the sensitive value, then replace only the value.
+# This preserves original spacing/punctuation.
+
+# Case 1: mask only the contentId value after "... filter <mobile> ... contentId <VAL>"
 CASE1_PATTERN = re.compile(
-    rf'(?i)(adding\s+mobileNo\s+in\s+header\s+in\s+device\s+id\s+filter)\s+({MOBILE_REGEX})\s*,\s*contentId\s+([A-Za-z0-9_-]+)'
+    r'(?i)('
+    r'(?:adding\s+(?:mobile\s*no|mobileno)\s+in\s+header\s+in\s+device\s+id\s+filter)\s*[:\-]?\s*'
+    + MOBILE_TOKEN +
+    r'.{0,100}?\bcontentId\s+)'
+    r'([A-Za-z0-9_-]+)'
 )
 
 def case1_replace(m: re.Match) -> str:
-    # Keep prefix text and mobile, mask the contentId value (group 3).
-    prefix, mobile, _content = m.group(1), m.group(2), m.group(3)
-    return f"{prefix} {mobile}, contentId xxxx"
+    prefix = m.group(1)  # includes 'contentId ' with original spacing
+    return f"{prefix}xxxx"
 
-# Case 2:
-# "<mobile> and data {count=5} with expiration 685;PATH"
-# -> mask only the expiration number to "xxxx"
+# Case 2: mask the expiration number; keep the actual {count=...} and allow any text before <mobile_regex>.
+# Example: "... something ... <mobile_regex> and data {count=5} with expiration 685;PATH"
 CASE2_PATTERN = re.compile(
-    rf'({MOBILE_REGEX})\s+and\s+data\s*\{{\s*count\s*=\s*\d+\s*\}}\s+with\s+expiration\s+(\d+)',
-    re.IGNORECASE
+    r'(?i)('
+    + MOBILE_TOKEN +
+    r'.{0,200}?\bdata\s*\{\s*count\s*=\s*\d+\s*\}\s*.*?\bwith\s+expiration\s+)'
+    r'(\d+)'
 )
 
 def case2_replace(m: re.Match) -> str:
-    mobile = m.group(1)
-    return f"{mobile} and data {{count=5}} with expiration xxxx"
+    prefix = m.group(1)  # includes the original {count=...} and spacing
+    return f"{prefix}xxxx"
 
-# Case 3:
-# "fetching record for : <mobile>_njcd4839...;PATH"
-# -> mask the suffix token after mobile that starts with "_" up to ';' (or end)
+# Case 3: mask the suffix token after the mobile that starts with "_"
+# Example: "fetching record for : <mobile_regex>_njcd4839...;PATH"
 CASE3_PATTERN = re.compile(
-    rf'(?i)(fetching\s+record\s+for\s*:\s*)({MOBILE_REGEX})(_[^; \t\r\n]*)'
+    r'(?i)('
+    r'fetching\s+record\s+for\s*:?\s*'
+    + MOBILE_TOKEN +
+    r')(_[^;\s\r\n]*)'
 )
 
 def case3_replace(m: re.Match) -> str:
-    prefix, mobile = m.group(1), m.group(2)
-    return f"{prefix}{mobile}xxxx"
+    prefix = m.group(1)  # up to and including the mobile token
+    return f"{prefix}xxxx"
 
-# Case 4:
-# "uuidSet expiry for User: <mobile> is: 42601 sec;PATH"
-# -> mask only the seconds number (keep "sec")
+# Case 4: mask the seconds number before 'sec'
+# Example: "uuidSet expiry for User: <mobile_regex> is: 42601 sec;PATH"
 CASE4_PATTERN = re.compile(
-    rf'(?i)(uuidSet\s+expiry\s+for\s+User:\s*)({MOBILE_REGEX})(\s*is:\s*)(\d+)(\s*sec)'
+    r'(?i)('
+    r'uuidSet\s+expiry\s+for\s+User:\s*'
+    + MOBILE_TOKEN +
+    r'\s*is:\s*)'
+    r'(\d+)'
+    r'(\s*sec)'
 )
 
 def case4_replace(m: re.Match) -> str:
-    prefix, mobile, is_part, _num, sec = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-    return f"{prefix}{mobile}{is_part}xxxx{sec}"
+    prefix, tail = m.group(1), m.group(3)
+    return f"{prefix}xxxx{tail}"
 
 # Ordered list of cases (first match wins)
 CASES: List[Tuple[str, re.Pattern, callable]] = [
@@ -98,11 +107,9 @@ def list_input_files(root: str) -> List[Path]:
     p = Path(root)
     if not p.exists():
         return []
-    files = [x for x in sorted(p.iterdir()) if x.is_file() and x.suffix.lower() in ALLOWED_EXTS]
-    return files
+    return [x for x in sorted(p.iterdir()) if x.is_file() and x.suffix.lower() in ALLOWED_EXTS]
 
 def already_done(file_path: Path) -> bool:
-    # If RESUME_LOG exists and contains the file path, skip it.
     if not Path(RESUME_LOG).exists():
         return False
     try:
@@ -122,10 +129,6 @@ def mark_done(file_path: Path) -> None:
         pass
 
 def apply_cases(line: str, counters: Dict[str, int]) -> Tuple[str, Optional[str]]:
-    """
-    Try each case in order; on first match, apply mask and return.
-    Returns (new_line, matched_case_name or None).
-    """
     for case_name, pattern, repl_func in CASES:
         m = pattern.search(line)
         if m:
@@ -135,9 +138,6 @@ def apply_cases(line: str, counters: Dict[str, int]) -> Tuple[str, Optional[str]
     return line, None
 
 def process_file(file_path: Path) -> Dict[str, int]:
-    """
-    Process a single file; returns a dict of local stats.
-    """
     local = defaultdict(int)
     local["lines_total"] = 0
     local["lines_modified"] = 0
@@ -149,16 +149,13 @@ def process_file(file_path: Path) -> Dict[str, int]:
     out_path = out_dir / file_path.name
 
     try:
-        # Count lines first for a proper inner progress bar
         try:
             with open(file_path, "r", encoding=ENCODING, errors=ERRORS_POLICY) as f:
                 for _ in f:
                     local["lines_total"] += 1
         except Exception:
-            # Fallback: process without inner bar if counting fails
             local["lines_total"] = 0
 
-        processed = 0
         with open(file_path, "r", encoding=ENCODING, errors=ERRORS_POLICY) as fin, \
              open(out_path, "w", encoding=ENCODING, errors=ERRORS_POLICY) as fout:
 
@@ -171,9 +168,7 @@ def process_file(file_path: Path) -> Dict[str, int]:
                 modified, matched_case = apply_cases(original, local)
                 if matched_case:
                     local["lines_modified"] += 1
-                # Always write (we only mask; never drop)
                 fout.write(modified + "\n")
-                processed += 1
 
         local["status"] = 1
     except Exception:
@@ -209,7 +204,6 @@ def write_summary(summary: Dict[str, any]) -> None:
                     f.write(f"  - {path}\n")
                     f.write("    " + "\n    ".join(err.strip().splitlines()) + "\n")
     except Exception:
-        # Last resort: print to stderr
         print("Failed to write summary_report.txt", file=sys.stderr)
 
 def main():
@@ -227,7 +221,6 @@ def main():
         "errors": [],
     }
 
-    # Filter out files already completed (resume-safe)
     todo = [p for p in files if not already_done(p)]
 
     with tqdm(total=len(todo), desc="Files", leave=True) as pbar:
@@ -239,7 +232,6 @@ def main():
                 pbar.update(1)
                 try:
                     local = fut.result()
-                    # aggregate
                     if local.get("status", 0) == 1:
                         summary["files_succeeded"] += 1
                         mark_done(p)
