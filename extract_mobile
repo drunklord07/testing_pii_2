@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+import re
+import sys
+import traceback
+import threading
+import time
+import random
+import multiprocessing as mp
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict
+from datetime import datetime
+from tqdm import tqdm
+
+# ============= CONFIG ============= #
+INPUT_FOLDER    = "input_logs"          # put your input folder name here (in current dir)
+OUTPUT_FOLDER   = "output_mobile"       # outputs will be created under this
+MAX_WORKERS     = 6
+CHUNK_SIZE      = 10_000                # files of 10k rows each
+MIRROR_TRUNCATE = 1500                  # max chars of log_line kept in mirror output
+SUMMARY_REFRESH_INTERVAL = 30           # seconds (live summary rewrite)
+QUEUE_MAXSIZE   = 10000                 # queue capacity for backpressure
+BATCH_FLUSH_EVERY = 500                 # send batches from workers to cut IPC overhead
+# JSON nested key-path inference (hardcoded per your request)
+NESTED_JSON_DETECT   = True       # enable nested JSON key-path inference
+FIELD_PATH_MODE      = "full"     # "last" -> just the leaf key; or "full" -> dotted path
+JSON_BACKSCAN_WINDOW = 800        # chars to scan left from the match for speed
+# ================================== #
+
+OUT_FIELDS_DIR  = Path(OUTPUT_FOLDER) / "fields_identified"
+OUT_MIRROR_DIR  = Path(OUTPUT_FOLDER) / "mirror"
+SUMMARY_FILE    = Path(OUTPUT_FOLDER) / "summary_mobile_fields.txt"
+ERRORS_FILE     = Path(OUTPUT_FOLDER) / "errors.log"
+
+# Strict mobile regex (India 10 or prefixed 91 + 10); prevents A–Z / 0–9 adjacency
+MOBILE_RE = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
+
+SENTINEL = object()  # unique sentinel, picklable
+
+
+# ---------- field detection patterns ----------
+def make_patterns(mobile_escaped: str):
+    # 1) JSON-quoted keys: "mobile":"987..." or 'phone' : 987...
+    p_json_quoted = re.compile(
+        rf'["\']\s*(?P<field>[^"\']+?)\s*["\']\s*[:=]\s*["\']?(?P<mobile>{mobile_escaped})["\']?',
+        re.IGNORECASE,
+    )
+    # 2) Key:Value / Key=Value
+    p_kv = re.compile(
+        rf'\b(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*["\']?(?P<mobile>{mobile_escaped})["\']?',
+        re.IGNORECASE,
+    )
+    # 3) XML attribute: <tag field="987...">
+    p_xml_attr = re.compile(
+        rf'<[^>]*\b(?P<field>[A-Za-z0-9_.\-]+)\s*=\s*["\'](?P<mobile>{mobile_escaped})["\'][^>]*>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    # 4) XML tag content: <field>987...</field>
+    p_xml_tag = re.compile(
+        rf'<\s*(?P<field>[A-Za-z0-9_.\-]+)[^>]*>[^<]*?(?P<mobile>{mobile_escaped})[^<]*?</\s*\1\s*>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    # 5) NEW: Bracketed keys: [MobileNo: 987...] or [Phone=987...]
+    p_bracketed = re.compile(
+        rf'\[\s*(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<mobile>{mobile_escaped})\s*\]',
+        re.IGNORECASE,
+    )
+    # 6a) NEW: Curly fragments: {custId=123, phone=987...}
+    p_curly = re.compile(
+        rf'\{{[^}}]*?(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<mobile>{mobile_escaped})(?:[^}}]*?)\}}',
+        re.IGNORECASE,
+    )
+    # 6b) NEW: XML inline: <field name=mobile>987...</field>
+    p_xml_inline = re.compile(
+        rf'<[^>]*?\bname\s*=\s*["\']?(?P<field>[A-Za-z0-9_.\-]+)["\']?[^>]*>'
+        rf'[^<]*?(?P<mobile>{mobile_escaped})[^<]*?</[^>]+>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    return (p_json_quoted, p_kv, p_xml_attr, p_xml_tag, p_bracketed, p_curly, p_xml_inline)
+
+
+def _quote_aware_scan_levels(s: str):
+    """
+    Precompute nesting level ({} / []) at each index, ignoring braces inside strings.
+    Returns a list `lvl` where lvl[i] is the object/array depth BEFORE s[i].
+    """
+    lvl = [0] * (len(s) + 1)
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch in '{[':
+                depth += 1
+            elif ch in '}]' and depth > 0:
+                depth -= 1
+        lvl[i+1] = depth
+    return lvl
+
+_key_colon_re = re.compile(r'"(?P<k>[^"\\]+)"\s*:')
+
+def _nearest_json_key_for_value(s: str, val_start: int, window: int = 400, path_mode: str = "last"):
+    """
+    Heuristic: within a backscan window, find the nearest JSON key at the same or enclosing depth
+    that plausibly owns the value starting at val_start.
+    Returns either the leaf key or dotted path, or None.
+    """
+    if val_start <= 0:
+        return None
+    L = max(0, val_start - window)
+    slice_s = s[L:val_start]
+    # Precompute depth levels for the slice; offset when reading
+    lvl = _quote_aware_scan_levels(slice_s)
+    # Depth at the value position (relative to slice end)
+    depth_at_val = lvl[-1]
+
+    candidates = []
+    for m in _key_colon_re.finditer(slice_s):
+        k = m.group('k').strip()
+        pos_after_colon = m.end()
+        key_depth = lvl[m.start()]  # level before the quote
+        candidates.append((m.start(), pos_after_colon, key_depth, k))
+
+    if not candidates:
+        return None
+
+    # Choose the last candidate whose value likely spans to our val_start
+    best_key = None
+    best_key_depth = -1
+    for start_idx, after_colon, key_depth, key in reversed(candidates):
+        cut = False
+        base_depth = lvl[start_idx]
+        for i in range(after_colon, len(slice_s)):
+            if slice_s[i] == ',' and lvl[i] == base_depth:
+                if (L + i) < val_start:
+                    cut = True
+                    break
+            if slice_s[i] in '}]' and lvl[i+1] < base_depth:
+                if (L + i) < val_start:
+                    cut = True
+                    break
+        if not cut:
+            best_key = key
+            best_key_depth = key_depth
+            break
+
+    if best_key is None:
+        return None
+
+    if path_mode == "last":
+        return best_key
+
+    # Build dotted path by walking backwards to collect ancestor keys at decreasing depths
+    path = [best_key]
+    target_depth = best_key_depth
+    for start_idx, after_colon, key_depth, key in reversed(candidates):
+        if key_depth < target_depth:
+            path.append(key)
+            target_depth = key_depth
+    path.reverse()
+    return ".".join(path)
+
+
+def identify_field_for_mobile(log_line: str, mobile: str):
+    mob_esc = re.escape(mobile)
+    for pat in make_patterns(mob_esc):
+        m = pat.search(log_line)
+        if m:
+            field = m.group("field").strip()
+            if field:
+                return field
+
+    # Fallback: nested JSON key inference (hardcoded ON; full path)
+    if NESTED_JSON_DETECT:
+        idx = log_line.find(mobile)
+        if idx != -1:
+            key_or_path = _nearest_json_key_for_value(
+                log_line,
+                val_start=idx,
+                window=JSON_BACKSCAN_WINDOW,
+                path_mode=FIELD_PATH_MODE,
+            )
+            if key_or_path:
+                return key_or_path
+
+    return None
+
+
+def _flush_batch(q, buf):
+    if buf:
+        q.put("".join(buf))
+        buf.clear()
+
+
+def process_file(path: Path, extracted_q, mirror_q):
+    stats = defaultdict(int)
+    per_field_counts = defaultdict(int)
+    per_field_example = {}
+    path_only_samples = []
+    file_failed = False
+
+    # Localize globals for speed in the hot loop
+    mobile_re = MOBILE_RE
+    identify = identify_field_for_mobile
+    trunc = MIRROR_TRUNCATE
+    batch_n = BATCH_FLUSH_EVERY
+
+    extr_buf, mirr_buf = [], []
+
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+
+                if ";" in line:
+                    log_line, file_path = line.rsplit(";", 1)
+                else:
+                    log_line, file_path = line, ""
+
+                matches = list(mobile_re.finditer(line))
+                if not matches:
+                    stats["lines_no_regex"] += 1
+                    continue
+
+                split_at = len(log_line)
+                log_matches  = [m for m in matches if m.start() < split_at]
+                path_matches = [m for m in matches if m.start() >= split_at]
+
+                stats["total_regex_matches"] += len(matches)
+
+                if (not log_matches) and path_matches:
+                    stats["dropped_path_only_matches"] += len(path_matches)
+                    if len(path_only_samples) < 20:
+                        path_only_samples.append(line)
+                    continue
+
+                line_had_extracted = False
+                line_had_mirrored  = False
+
+                for m in log_matches:
+                    mobile_val = m.group(0)
+                    field = identify(log_line, mobile_val)
+
+                    if field:
+                        row = f"{log_line} ; {file_path} ; {field} ; mobile_regex ; {mobile_val}\n"
+                        extr_buf.append(row)
+                        stats["extracted_matches"] += 1
+                        per_field_counts[field] += 1
+                        if field not in per_field_example:
+                            per_field_example[field] = row.strip()
+                        line_had_extracted = True
+                    else:
+                        # Mirror without reason flag, per your request
+                        short_log = (log_line[:trunc] + "...TRUNCATED...") if len(log_line) > trunc else log_line
+                        row = f"{short_log} ; {file_path} ; UNIDENTIFIED_FIELD ; mobile_regex ; {mobile_val}\n"
+                        mirr_buf.append(row)
+                        stats["mirrored_matches"] += 1
+                        line_had_mirrored = True
+
+                    # Batch flush to reduce IPC overhead
+                    if len(extr_buf) >= batch_n:
+                        _flush_batch(extracted_q, extr_buf)
+                    if len(mirr_buf) >= batch_n:
+                        _flush_batch(mirror_q, mirr_buf)
+
+                if line_had_extracted and line_had_mirrored:
+                    stats["partial_valid_lines"] += 1
+
+        # final flush for this file
+        _flush_batch(extracted_q, extr_buf)
+        _flush_batch(mirror_q, mirr_buf)
+
+    except Exception as e:
+        stats["errors"] += 1
+        file_failed = True
+        try:
+            with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
+                ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] {path}: {e}\n")
+                ef.write(traceback.format_exc() + "\n")
+        except Exception:
+            pass
+
+    return stats, per_field_counts, per_field_example, path_only_samples, file_failed
+
+
+def writer_loop(queue: mp.Queue, base_dir: Path, prefix: str, chunk_size: int):
+    base_dir.mkdir(parents=True, exist_ok=True)
+    counter, lines = 1, 0
+    fh = (base_dir / f"{prefix}_{counter:03d}.txt").open("w", encoding="utf-8")
+    try:
+        while True:
+            item = queue.get()  # blocking, no polling
+            if item is SENTINEL:
+                break
+            fh.write(item)
+            lines += item.count("\n")
+            if lines >= chunk_size:
+                fh.close()
+                counter += 1
+                lines = 0
+                fh = (base_dir / f"{prefix}_{counter:03d}.txt").open("w", encoding="utf-8")
+    finally:
+        fh.close()
+
+
+def write_summary(input_dir: Path,
+                  G_stats: dict,
+                  G_field_counts: dict,
+                  G_field_example: dict,
+                  G_path_only_samples: list,
+                  failed_files: list,
+                  stage: str = "Final"):
+    total_matches     = G_stats.get("total_regex_matches", 0)
+    extracted_matches = G_stats.get("extracted_matches", 0)
+    mirrored_matches  = G_stats.get("mirrored_matches", 0)
+    dropped_path_only = G_stats.get("dropped_path_only_matches", 0)
+    lines_no_regex    = G_stats.get("lines_no_regex", 0)
+    errors_count      = G_stats.get("errors", 0)
+    partial_lines     = G_stats.get("partial_valid_lines", 0)
+    files_total       = G_stats.get("files_total", 0)
+    files_processed   = G_stats.get("files_processed", 0)
+    files_failed      = G_stats.get("files_failed", 0)
+
+    consistency_ok = (extracted_matches + mirrored_matches + dropped_path_only) == total_matches
+
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as sf:
+        sf.write(f"Summary ({stage}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        sf.write("=" * 60 + "\n\n")
+
+        sf.write("INPUT / OUTPUT\n")
+        sf.write(f"Input folder: {input_dir.resolve()}\n")
+        sf.write(f"Output folder: {Path(OUTPUT_FOLDER).resolve()}\n")
+        sf.write(f"Fields Identified (chunk size {CHUNK_SIZE}): {OUT_FIELDS_DIR.resolve()}\n")
+        sf.write(f"Mirror (chunk size {CHUNK_SIZE}): {OUT_MIRROR_DIR.resolve()}\n")
+        sf.write(f"Mirror truncation: first {MIRROR_TRUNCATE} chars of log_line\n\n")
+
+        sf.write("FILE COUNTS\n")
+        sf.write(f"Total files discovered: {files_total}\n")
+        sf.write(f"Files processed successfully: {files_processed}\n")
+        sf.write(f"Files failed: {files_failed}\n\n")
+
+        if failed_files:
+            sf.write("FAILED FILES\n")
+            for f in failed_files:
+                sf.write(f"- {f}\n")
+            sf.write("\n")
+
+        sf.write("COUNTS\n")
+        sf.write(f"Total regex matches: {total_matches}\n")
+        sf.write(f"  Extracted matches: {extracted_matches}\n")
+        sf.write(f"  Mirrored matches:  {mirrored_matches}\n")
+        sf.write(f"  Dropped (path-only matches): {dropped_path_only}\n")
+        sf.write(f"Lines with no regex at all (dropped lines): {lines_no_regex}\n")
+        sf.write(f"Partial-valid lines: {partial_lines}\n")
+        sf.write(f"Errors: {errors_count}\n")
+        sf.write(f"Consistency check: {consistency_ok}\n\n")
+
+        sf.write("PER-FIELD COUNTS (extracted)\n")
+        for fld, cnt in sorted(G_field_counts.items(), key=lambda kv: kv[0].lower()):
+            sf.write(f"{fld} = {cnt}\n")
+            ex = G_field_example.get(fld)
+            if ex:
+                sf.write(f"  Example: {ex}\n")
+        sf.write("\n")
+
+        sf.write("SAMPLE PATH-ONLY LINES\n")
+        if G_path_only_samples:
+            for i, ln in enumerate(G_path_only_samples[:50], 1):
+                sf.write(f"{i}. {ln}\n")
+        else:
+            sf.write("(none)\n")
+        sf.write("\n")
+
+        sf.write("NOTES\n")
+        sf.write("- Extraction strictly on allowed field→value patterns (incl. brackets/curly/XML-inline).\n")
+        sf.write("- Nested-JSON key-path inference enabled; returns dotted paths.\n")
+        sf.write("- One output row per regex match. Path-only matches dropped.\n")
+        sf.write("- Mirror rows truncate log_line; reason flag omitted by request.\n")
+
+
+def summary_refresher_loop(input_dir: Path,
+                           G_stats: dict,
+                           G_field_counts: dict,
+                           G_field_example: dict,
+                           G_path_only_samples: list,
+                           failed_files: list,
+                           stop_event: threading.Event):
+    while not stop_event.is_set():
+        try:
+            write_summary(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, failed_files, stage="Live")
+        except Exception as e:
+            try:
+                with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
+                    ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] summary_refresher: {e}\n")
+                    ef.write(traceback.format_exc() + "\n")
+            except Exception:
+                pass
+        stop_event.wait(SUMMARY_REFRESH_INTERVAL)
+
+
+def main():
+    input_dir = Path(INPUT_FOLDER)
+    if not input_dir.exists():
+        print(f"Input folder not found: {input_dir.resolve()}")
+        sys.exit(1)
+
+    Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
+    OUT_FIELDS_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_MIRROR_DIR.mkdir(parents=True, exist_ok=True)
+
+    files = [p for p in input_dir.rglob("*.txt")]
+    if not files:
+        print("No .txt files found in input.")
+        write_summary(input_dir, defaultdict(int), {}, {}, [], [], stage="Final")
+        sys.exit(0)
+
+    random.shuffle(files)
+
+    # Fast, real multiprocessing queues (no Manager proxy).
+    ctx = mp.get_context("spawn")
+    extracted_q: mp.Queue = ctx.Queue(maxsize=QUEUE_MAXSIZE)
+    mirror_q:    mp.Queue = ctx.Queue(maxsize=QUEUE_MAXSIZE)
+
+    # Start writers (they terminate on SENTINEL)
+    t_extr = threading.Thread(target=writer_loop, args=(extracted_q, OUT_FIELDS_DIR, "extracted", CHUNK_SIZE), daemon=True)
+    t_mirr = threading.Thread(target=writer_loop, args=(mirror_q, OUT_MIRROR_DIR, "mirror", CHUNK_SIZE), daemon=True)
+    t_extr.start()
+    t_mirr.start()
+
+    G_stats = defaultdict(int)
+    G_field_counts = defaultdict(int)
+    G_field_example = {}
+    G_path_only_samples = []
+    failed_files = []
+
+    G_stats["files_total"] = len(files)
+
+    # Live summary refresher
+    stop_event = threading.Event()
+    refresher = threading.Thread(target=summary_refresher_loop,
+                                 args=(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, failed_files, stop_event),
+                                 daemon=True)
+    refresher.start()
+
+    # Process files
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as ex:
+        futures = {ex.submit(process_file, p, extracted_q, mirror_q): p for p in files}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
+            path = futures[fut]
+            try:
+                stats, field_counts, field_example, path_only, file_failed = fut.result()
+                if file_failed:
+                    G_stats["files_failed"] += 1
+                    failed_files.append(str(path))
+                else:
+                    G_stats["files_processed"] += 1
+
+                for k, v in stats.items():
+                    G_stats[k] += v
+                for k, v in field_counts.items():
+                    G_field_counts[k] += v
+                for k, v in field_example.items():
+                    if k not in G_field_example:
+                        G_field_example[k] = v
+                if path_only:
+                    take = 50 - len(G_path_only_samples)
+                    if take > 0:
+                        G_path_only_samples.extend(path_only[:take])
+            except Exception as e:
+                G_stats["files_failed"] += 1
+                failed_files.append(str(path))
+                try:
+                    with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
+                        ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] {path}: {e}\n")
+                        ef.write(traceback.format_exc() + "\n")
+                except Exception:
+                    pass
+
+    # Graceful writer shutdown: send one SENTINEL per writer
+    extracted_q.put(SENTINEL)
+    mirror_q.put(SENTINEL)
+    t_extr.join()
+    t_mirr.join()
+
+    # Stop refresher and write final summary
+    stop_event.set()
+    refresher.join(timeout=2)
+    write_summary(input_dir, G_stats, G_field_counts, G_field_example, G_path_only_samples, failed_files, stage="Final")
+
+    print("\n✅ Done.")
+    print(f"Total files: {G_stats['files_total']}  |  Processed: {G_stats['files_processed']}  |  Failed: {G_stats['files_failed']}")
+    print(f"Extracted files in: {OUT_FIELDS_DIR.resolve()}")
+    print(f"Mirror files in:    {OUT_MIRROR_DIR.resolve()}")
+    print(f"Summary:            {SUMMARY_FILE.resolve()}")
+    if G_stats['files_failed'] > 0:
+        print(f"Errors logged:      {ERRORS_FILE.resolve()}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("Fatal error:", e)
+        print(traceback.format_exc())
