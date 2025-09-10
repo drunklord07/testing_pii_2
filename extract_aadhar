@@ -1,0 +1,14 @@
+AADHAAR_RE = re.compile(
+    r'(?<![A-Za-z0-9])'      # no alpha/digit just before
+    r'[2-9][0-9]{11}'        # 12 digits, first between 2–9
+    r'(?![A-Za-z0-9])'       # no alpha/digit just after
+)
+
+
+
+VOTERID_RE = re.compile(
+    r'(?<![A-Za-z0-9])'      # no alpha/digit before
+    r'[A-Z]{3}[0-9]{7}'      # 3 letters + 7 digits
+    r'(?![A-Za-z0-9])',      # no alpha/digit after
+    re.IGNORECASE
+)
