@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Regex extraction script for PAN numbers.
+- Mirrors the final working mobile script
+- PAN regex substituted
+- Output folders & summary file renamed
+"""
+
+import os
+import re
+import sys
+import time
+import json
+import uuid
+import queue
+import traceback
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+import multiprocessing as mp
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+INPUT_FOLDER = "cleaned_output18/regex_matches/pan"
+OUTPUT_FOLDER = "output_pan_regex"
+FIELDS_DIR = os.path.join(OUTPUT_FOLDER, "fields_identified")
+MIRROR_DIR = os.path.join(OUTPUT_FOLDER, "mirror")
+SUMMARY_FILE = os.path.join(OUTPUT_FOLDER, "summary_pan_fields.txt")
+ERROR_LOG = os.path.join(OUTPUT_FOLDER, "errors.log")
+RESUME_LOG = os.path.join(OUTPUT_FOLDER, "resume_files.log")
+
+# DB for deduplication
+DB_FILE = os.path.join(OUTPUT_FOLDER, "dedup_index.sqlite")
+
+CHUNK_SIZE = 10000            # lines per output file
+MAX_LINE_LEN = 1500           # truncate long lines for mirror
+MAX_WORKERS = max(2, mp.cpu_count() - 2)
+
+RUN_ID = uuid.uuid4().hex     # unique ID per run
+
+# ============================================================
+# REGEX DEFINITIONS
+# ============================================================
+
+# PAN: 5 letters + 4 digits + 1 letter
+PAN_RE = re.compile(r'(?<![A-Za-z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Za-z0-9])',
+                    re.IGNORECASE)
+
+# ============================================================
+# UTILITY
+# ============================================================
+def _safe_trunc(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n] + "…[truncated]"
+
+def log_error(msg: str):
+    with open(ERROR_LOG, "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+
+# ============================================================
+# FIELD DETECTION (same as before: JSON, kv, XML, brackets)
+# ============================================================
+FIELD_PATTERNS = [
+    re.compile(r'"([\w.-]+)"\s*:\s*"?([^",}]+)"?'),
+    re.compile(r'([\w.-]+)\s*[:=]\s*([\w./-]+)'),
+    re.compile(r'(\w+)="([^"]+)"'),
+    re.compile(r'<(\w+)>([^<]+)</\1>'),
+    re.compile(r'\[([A-Za-z0-9_.-]+):\s*([^\]]+)\]')
+]
+
+def detect_fields(log_line: str, matches):
+    """
+    Given a log_line and regex matches, detect field names.
+    Returns dict {field -> value}.
+    """
+    found = {}
+    for m in matches:
+        val = m.group(0)
+        for pat in FIELD_PATTERNS:
+            for f in pat.finditer(log_line):
+                key, v = f.groups()
+                if val in v:
+                    found[key] = val
+    return found or {"PAN": matches[0].group(0)}  # fallback
+
+# ============================================================
+# WORKER FUNCTION
+# ============================================================
+def process_file(path: Path):
+    extracted, mirrored = [], []
+    counts = {"regex": 0, "extracted": 0, "mirrored": 0,
+              "partial_valid": 0, "no_match": 0}
+    examples = {}
+
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+
+                # split into log line and path
+                if ";" in line:
+                    log_part, file_path = line.rsplit(";", 1)
+                else:
+                    log_part, file_path = line, ""
+
+                matches = list(PAN_RE.finditer(log_part))
+                counts["regex"] += len(matches)
+
+                if not matches:
+                    counts["no_match"] += 1
+                    continue
+
+                # per-line dedup by field
+                field_map = detect_fields(log_part, matches)
+                unique_fields = {}
+                for k, v in field_map.items():
+                    if k not in unique_fields:
+                        unique_fields[k] = v
+
+                for field, val in unique_fields.items():
+                    row = f"{val};{field};{_safe_trunc(log_part, MAX_LINE_LEN)};{file_path}"
+                    extracted.append(row)
+                    counts["extracted"] += 1
+                    if field not in examples:
+                        examples[field] = row[:500]
+
+                # mirror copy
+                mirror_row = f"{_safe_trunc(log_part, MAX_LINE_LEN)};{file_path}"
+                mirrored.append(mirror_row)
+                counts["mirrored"] += 1
+
+    except Exception as e:
+        log_error(f"process_file: {path} failed: {e}\n{traceback.format_exc()}")
+        return None
+
+    return path, extracted, mirrored, counts, examples
+
+# ============================================================
+# WRITE HELPERS
+# ============================================================
+def chunk_writer(base_dir, prefix, rows):
+    Path(base_dir).mkdir(parents=True, exist_ok=True)
+    out_files, buf, idx = [], [], 1
+
+    for row in rows:
+        buf.append(row + "\n")
+        if len(buf) >= CHUNK_SIZE:
+            fname = os.path.join(base_dir, f"{prefix}_{idx:03d}.txt")
+            with open(fname, "w", encoding="utf-8") as f:
+                f.writelines(buf)
+            out_files.append(fname)
+            buf, idx = [], idx + 1
+
+    if buf:
+        fname = os.path.join(base_dir, f"{prefix}_{idx:03d}.txt")
+        with open(fname, "w", encoding="utf-8") as f:
+            f.writelines(buf)
+        out_files.append(fname)
+
+    return out_files
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
+    Path(FIELDS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(MIRROR_DIR).mkdir(parents=True, exist_ok=True)
+
+    all_counts = {"regex": 0, "extracted": 0, "mirrored": 0,
+                  "partial_valid": 0, "no_match": 0}
+    examples = {}
+    extracted_all, mirrored_all = [], []
+
+    files = sorted(Path(INPUT_FOLDER).glob("*.txt"))
+    total = len(files)
+    if total == 0:
+        print("No input files found")
+        return
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as exe:
+        futs = {exe.submit(process_file, f): f for f in files}
+        for fut in tqdm(as_completed(futs), total=total, desc="Processing"):
+            res = fut.result()
+            if not res:
+                continue
+            _, extracted, mirrored, counts, ex = res
+            extracted_all.extend(extracted)
+            mirrored_all.extend(mirrored)
+            for k in all_counts:
+                all_counts[k] += counts[k]
+            for k, v in ex.items():
+                if k not in examples:
+                    examples[k] = v
+
+    # write outputs
+    chunk_writer(FIELDS_DIR, "extracted", extracted_all)
+    chunk_writer(MIRROR_DIR, "mirror", mirrored_all)
+
+    # summary
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write(f"Summary (PAN extraction) - {datetime.now():%Y-%m-%d %H:%M:%S}\n\n")
+        f.write(f"RUN_ID: {RUN_ID}\n")
+        f.write(f"Input folder: {INPUT_FOLDER}\n")
+        f.write(f"Output folder: {OUTPUT_FOLDER}\n\n")
+
+        f.write("FILE COUNTS\n")
+        f.write(f"Total files discovered: {total}\n")
+        f.write(f"Files processed successfully: {total}\n\n")
+
+        f.write("COUNTS\n")
+        for k, v in all_counts.items():
+            f.write(f"{k}: {v}\n")
+        f.write("\n")
+
+        f.write("PER-FIELD EXAMPLES (truncated)\n")
+        for k, v in examples.items():
+            f.write(f"{k}: {v}\n")
+
+    print("✅ Done. Summary written to", SUMMARY_FILE)
+
+
+if __name__ == "__main__":
+    main()
