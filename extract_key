@@ -1,0 +1,793 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Keyword-based field→value extractor with:
+- ProcessPoolExecutor (parallel)
+- SQLite resume/dedupe (skip unchanged files)
+- Mirrored output folder structure
+- Chunking: 10,000 lines per output file, named chunk0001.txt, ...
+- Live summary refresher (every 30s)
+- Comprehensive summary with:
+  - Overall stats
+  - Per-folder stats (lines scanned, extracted, skipped invalid, skipped no-keyword)
+  - Per-category stats (extracted, skipped)
+  - Examples (first few per category)
+  - Error section (and error.log on disk)
+- Strict extraction grammar (NO risky “next token” guessing):
+  - Colon/Equals/Dash with whitespace tolerance
+  - JSON-style quotes
+  - XML tags
+  - Square brackets
+- Folder-scoped keyword sets (each folder checks only its category keywords)
+- Category validations per your final rules:
+  - AccountNumber: numeric only, not mobile-like
+  - CustomerId: numeric only, not mobile-like
+  - Name: human-like (>=2 words), skip null/short/alnum/ids/tech
+  - DOB: many date formats accepted (YY and YYYY)
+  - Address: skip URLs/IPs/PIN-only and `IP-Address` key
+- NEW: Skipped lines are saved to output/<folder>/skipped/...
+"""
+
+import argparse
+import concurrent.futures
+import os
+import re
+import sqlite3
+import sys
+import threading
+import time
+from collections import defaultdict, Counter
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+
+from tqdm import tqdm
+
+# =========================
+# Configuration defaults
+# =========================
+DEFAULT_MAX_WORKERS = 6
+ALLOWED_EXTS = (".txt",)
+CHUNK_SIZE = 10_000
+SUMMARY_FILENAME = "summary_keywords.txt"
+DB_NAME = ".keyword_index.sqlite"
+ERROR_LOG = "error.log"
+RESUME_LOG = "resume_files.log"  # append-only
+
+FOLDER_TO_CATEGORY = {
+    "account_number": "ACCOUNT_NUMBER_KEYWORD",
+    "customer_id": "CUSTOMER_ID_KEYWORD",
+    "name": "NAME_KEYWORD",
+    "dob": "DOB_KEYWORD",
+    "address": "ADDRESS_KEYWORD",
+}
+
+# =========================
+# Keyword phrases per category (case-insensitive)
+# Spaces are allowed; underscores/hyphens/camelCase will be matched with regex.
+# =========================
+KEYWORD_PHRASES: Dict[str, List[str]] = {
+    "ACCOUNT_NUMBER_KEYWORD": [
+        "account number", "acc number", "bank account", "account no", "a/c no", "accountnumber"
+    ],
+    "CUSTOMER_ID_KEYWORD": [
+        "customer id", "cust id", "customer number", "cust", "customerid", "custid"
+    ],
+    "NAME_KEYWORD": [
+        "name", "nameFull", "full name", "nam", "fathername", "mothername", "custname"
+    ],
+    "DOB_KEYWORD": [
+        "dob", "custDob", "date of birth", "birthdate", "born on"
+    ],
+    "ADDRESS_KEYWORD": [
+        "address", "full address", "complete address", "residential address", "permanent address", "addr", "addressPerPincode"
+    ],
+}
+
+# =========================
+# Utility regexes
+# =========================
+
+# URL & IPv4 for universal skipping
+URL_RE = re.compile(r'https?://', re.IGNORECASE)
+IPV4_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+
+# Mobile-like detector (strict, non-embedded)
+MOBILE_RE = re.compile(r'(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])')
+
+# PIN-only (6 digits)
+PIN6_RE = re.compile(r'^[ \t]*\d{6}[ \t]*$')
+
+# Name heuristics
+NAME_ALLOWED_RE = re.compile(r'^[A-Za-z][A-Za-z\.\-\s]*[A-Za-z]$')  # letters, spaces, dots, hyphens
+HAS_DIGIT_OR_UNDERSCORE_RE = re.compile(r'[\d_]')
+SHORT_TOKEN_RE = re.compile(r'^[A-Za-z]{1,3}$')  # Jio/IBM etc.
+
+# Build a tolerant keyword token:
+# - Case-insensitive
+# - Spaces in phrase → match [\s_\-]* (underscores/hyphens/whitespace)
+def phrase_to_keyword_pattern(phrase: str) -> str:
+    parts = [re.escape(p) for p in phrase.split()]
+    if len(parts) == 1:
+        return parts[0]
+    return r'(?:' + r'[\s_\-]*'.join(parts) + r')'
+
+# Extraction grammars:
+# NOTE: We *always* capture inside delimiters/brackets/tags (no next-token guessing).
+def build_extraction_regexes(keyword_tokens: List[str]) -> List[Tuple[str, re.Pattern]]:
+    """
+    For a given list of keyword token patterns, build regexes for:
+    - JSON quoted: "keyword" : "value"
+    - XML tags: <keyword> value </keyword>
+    - Square brackets: [ keyword : value ]
+    - Colon/Equals/Dash: keyword :/=/ - value (capture everything until a stopper; we still validate)
+    """
+    kw_alt = r'(?:' + r'|'.join(keyword_tokens) + r')'
+
+    # JSON quoted key: "keyword" : "value"
+    json_pat = re.compile(
+        rf'"(?:\s*{kw_alt}\s*)"\s*:\s*"([^"]*)"',
+        re.IGNORECASE
+    )
+
+    # XML tags: <keyword> value </keyword>
+    xml_pat = re.compile(
+        rf'<\s*({kw_alt})\s*>\s*(.*?)\s*<\s*/\s*\1\s*>',
+        re.IGNORECASE | re.DOTALL
+    )
+
+    # Square brackets: [ keyword : value ]
+    bracket_pat = re.compile(
+        rf'\[\s*({kw_alt})\s*(?::|=|-)\s*(.*?)\s*\]',
+        re.IGNORECASE
+    )
+
+    # Colon/Equals/Dash (plaintext with delimiter char)
+    ced_pat = re.compile(
+        rf'({kw_alt})\s*(?::|=|-)\s*(.*?)\s*(?=,|;|\]|\}}|<|$)',
+        re.IGNORECASE
+    )
+
+    return [
+        ("json", json_pat),
+        ("xml", xml_pat),
+        ("bracket", bracket_pat),
+        ("ced", ced_pat),
+    ]
+
+# =========================
+# Validation rules per category
+# =========================
+
+def is_mobile_like(val: str) -> bool:
+    digits = re.sub(r'\D+', '', val or '')
+    if not digits:
+        return False
+    if len(digits) == 10 and digits[0] in "6789":
+        return True
+    if len(digits) == 12 and digits.startswith('91') and digits[2] in "6789":
+        return True
+    return bool(MOBILE_RE.search(val))
+
+def clean_value(val: str) -> str:
+    if val is None:
+        return ""
+    v = val.strip().strip('"').strip("'").strip()
+    v = re.sub(r'\s+', ' ', v)
+    return v
+
+def is_valid_account_number(val: str) -> bool:
+    v = clean_value(val)
+    if not v or not v.isdigit():
+        return False
+    if is_mobile_like(v):
+        return False
+    return True
+
+def is_valid_customer_id(val: str) -> bool:
+    v = clean_value(val)
+    if not v or not v.isdigit():
+        return False
+    if is_mobile_like(v):
+        return False
+    return True
+
+def looks_like_human_name(val: str) -> bool:
+    v = clean_value(val)
+    if not v:
+        return False
+    if v.lower() == "null":
+        return False
+    if HAS_DIGIT_OR_UNDERSCORE_RE.search(v):
+        return False
+    if SHORT_TOKEN_RE.match(v):  # Jio, IBM etc.
+        return False
+    words = [w for w in v.split() if w]
+    if len(words) < 2:
+        return False
+    if not NAME_ALLOWED_RE.match(v):
+        return False
+    if "pin" in v.lower():
+        return False
+    return True
+
+DATE_FORMATS = [
+    "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+    "%d-%b-%Y", "%d %b %Y", "%b %d %Y", "%B %d %Y",
+    "%d-%b-%y", "%d %b %y", "%d %B %Y", "%d %B %y",
+    "%Y/%m/%d", "%y-%m-%d", "%d/%m/%y"
+]
+
+def is_valid_dob(val: str) -> bool:
+    v = clean_value(val)
+    if not v:
+        return False
+    if v.isdigit() and (len(v) >= 6):
+        return False
+    for fmt in DATE_FORMATS:
+        try:
+            _ = datetime.strptime(v, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+def is_valid_address(field_key: str, val: str) -> bool:
+    if field_key and field_key.strip().lower().replace('_','-') == "ip-address":
+        return False
+    v = clean_value(val)
+    if not v:
+        return False
+    if URL_RE.search(v):
+        return False
+    if IPV4_RE.search(v):
+        return False
+    if PIN6_RE.match(v):
+        return False
+    if not re.search(r'[A-Za-z]', v):
+        return False
+    if len(v) < 6:
+        return False
+    return True
+
+def validate_by_category(category: str, field_key: str, value: str) -> Tuple[bool, Optional[str]]:
+    if category == "ACCOUNT_NUMBER_KEYWORD":
+        ok = is_valid_account_number(value)
+        return ok, None if ok else "invalid_account_number"
+    if category == "CUSTOMER_ID_KEYWORD":
+        ok = is_valid_customer_id(value)
+        return ok, None if ok else "invalid_customer_id"
+    if category == "NAME_KEYWORD":
+        ok = looks_like_human_name(value)
+        return ok, None if ok else "invalid_name"
+    if category == "DOB_KEYWORD":
+        ok = is_valid_dob(value)
+        return ok, None if ok else "invalid_dob"
+    if category == "ADDRESS_KEYWORD":
+        ok = is_valid_address(field_key, value)
+        return ok, None if ok else "invalid_address"
+    return False, "unknown_category"
+
+def universal_value_rejects(field_key: str, value: str, category: str) -> Optional[str]:
+    v = clean_value(value)
+    if not v:
+        return "empty"
+    if v.lower() == "null":
+        return "null_value"
+    if re.fullmatch(r'[-\*]+', v):
+        return "punctuation_only"
+    if URL_RE.search(v):
+        return "url_value"
+    if IPV4_RE.search(v):
+        return "ip_value"
+    return None
+
+# =========================
+# SQLite helpers
+# =========================
+
+def ensure_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed_files (
+            file_path TEXT PRIMARY KEY,
+            mtime REAL,
+            size INTEGER,
+            processed_at TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+def file_fingerprint(p: Path) -> Tuple[float, int]:
+    st = p.stat()
+    return (st.st_mtime, st.st_size)
+
+def is_already_processed(conn: sqlite3.Connection, file_path: str, mtime: float, size: int) -> bool:
+    cur = conn.execute("SELECT mtime, size FROM processed_files WHERE file_path = ?", (file_path,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    return (abs(row[0] - mtime) < 1e-6) and (row[1] == size)
+
+def mark_processed(conn: sqlite3.Connection, file_path: str, mtime: float, size: int):
+    conn.execute("""
+        INSERT INTO processed_files(file_path, mtime, size, processed_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(file_path) DO UPDATE SET mtime=excluded.mtime, size=excluded.size, processed_at=excluded.processed_at
+    """, (file_path, mtime, size, datetime.now().isoformat(timespec='seconds')))
+    conn.commit()
+
+# =========================
+# I/O: chunk writers
+# =========================
+
+@dataclass
+class ChunkState:
+    out_dir: Path
+    chunk_idx: int = 1
+    lines_in_chunk: int = 0
+    handle: Optional[Any] = None  # file object
+
+    def ensure_handle(self):
+        if self.handle is None:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            fn = self.out_dir / f"chunk{self.chunk_idx:04d}.txt"
+            self.handle = fn.open("w", encoding="utf-8", errors="ignore")
+
+    def write_line(self, line: str):
+        self.ensure_handle()
+        self.handle.write(line + "\n")
+        self.lines_in_chunk += 1
+        if self.lines_in_chunk >= CHUNK_SIZE:
+            self.handle.close()
+            self.handle = None
+            self.chunk_idx += 1
+            self.lines_in_chunk = 0
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+# =========================
+# Extraction engine
+# =========================
+
+def compile_folder_specs() -> Dict[str, Dict]:
+    folder_specs = {}
+    for folder, category in FOLDER_TO_CATEGORY.items():
+        phrases = KEYWORD_PHRASES[category]
+        token_patterns = [phrase_to_keyword_pattern(p) for p in phrases]
+        regexes = build_extraction_regexes(token_patterns)
+        folder_specs[folder] = {
+            "category": category,
+            "phrases": phrases,
+            "regexes": regexes
+        }
+    return folder_specs
+
+def extract_line_matches(line: str, folder_spec: Dict) -> List[Tuple[str, str]]:
+    matches: List[Tuple[str, str]] = []
+    regexes = folder_spec["regexes"]
+    text = line
+
+    # JSON keys — capture value; use canonical phrase as field label
+    for phrase in folder_spec["phrases"]:
+        kp = phrase_to_keyword_pattern(phrase)
+        json_key_pat = re.compile(rf'"(?:\s*{kp}\s*)"\s*:\s*"([^"]*)"', re.IGNORECASE)
+        for m in json_key_pat.finditer(text):
+            field_key = phrase
+            val = m.group(1)
+            matches.append((field_key, val))
+
+    # XML
+    xml_pat = next((pat for name, pat in regexes if name == "xml"), None)
+    if xml_pat:
+        for m in xml_pat.finditer(text):
+            matches.append((m.group(1), m.group(2)))
+
+    # Square brackets
+    bracket_pat = next((pat for name, pat in regexes if name == "bracket"), None)
+    if bracket_pat:
+        for m in bracket_pat.finditer(text):
+            matches.append((m.group(1), m.group(2)))
+
+    # Colon / Equals / Dash
+    ced_pat = next((pat for name, pat in regexes if name == "ced"), None)
+    if ced_pat:
+        for m in ced_pat.finditer(text):
+            matches.append((m.group(1), m.group(2)))
+
+    return matches
+
+# =========================
+# Worker processing
+# =========================
+
+@dataclass
+class FileStats:
+    lines_scanned: int = 0
+    extracted: int = 0
+    skipped_invalid: int = 0
+    skipped_no_keyword: int = 0
+
+def process_file(file_path: str, folder: str, output_root: str, folder_spec: Dict) -> Dict:
+    """
+    Process a single file in a worker:
+      - Writes two temp files under output/.tmp:
+          *.ext  (valid extracted lines)
+          *.skip (skipped lines with reasons)
+      - Returns stats and temp paths for the parent process to merge.
+    """
+    out_tmp_dir = Path(output_root) / ".tmp"
+    out_tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_ext = out_tmp_dir / (Path(file_path).name + f".{os.getpid()}.ext")
+    tmp_skip = out_tmp_dir / (Path(file_path).name + f".{os.getpid()}.skip")
+    f_ext = tmp_ext.open("w", encoding="utf-8", errors="ignore")
+    f_skip = tmp_skip.open("w", encoding="utf-8", errors="ignore")
+
+    stats = FileStats()
+    errors: List[str] = []
+    examples_extracted: List[Tuple[str, str, str, str]] = []
+    examples_skipped: List[Tuple[str, str, str, str]] = []
+
+    category = FOLDER_TO_CATEGORY[folder]
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.rstrip("\n")
+                stats.lines_scanned += 1
+
+                # Find all (field_key, value) pairs
+                pairs = extract_line_matches(line, folder_spec)
+
+                if not pairs:
+                    stats.skipped_no_keyword += 1
+                    f_skip.write(f"{line} ; {file_path} ; SKIPPED ; no_keyword\n")
+                    continue
+
+                kept_value: Optional[str] = None
+                kept_field: Optional[str] = None
+                chosen = False
+
+                for field_key, value in pairs:
+                    v = clean_value(value)
+                    # Universal rejects
+                    ur = universal_value_rejects(field_key, v, category)
+                    if ur:
+                        if len(examples_skipped) < 8:
+                            examples_skipped.append((category, line, field_key, ur))
+                        continue
+
+                    # Category validation
+                    ok, reason = validate_by_category(category, field_key, v)
+                    if not ok:
+                        if len(examples_skipped) < 8:
+                            examples_skipped.append((category, line, field_key, reason or "invalid"))
+                        continue
+
+                    kept_value = v
+                    kept_field = field_key
+                    chosen = True
+                    break
+
+                if not chosen:
+                    stats.skipped_invalid += 1
+                    f_skip.write(f"{line} ; {file_path} ; SKIPPED ; invalid_value\n")
+                    continue
+
+                # Emit exactly one line per input line for this folder
+                out_line = f"{line} ; {file_path} ; {kept_field} ; {category} ; {kept_value}"
+                f_ext.write(out_line + "\n")
+                stats.extracted += 1
+
+                if len(examples_extracted) < 8:
+                    examples_extracted.append((category, line, kept_field, kept_value))
+
+    except Exception as e:
+        tb = f"{file_path} :: {type(e).__name__}: {e}"
+        errors.append(tb)
+
+    f_ext.close()
+    f_skip.close()
+
+    return {
+        "tmp_ext": str(tmp_ext),
+        "tmp_skip": str(tmp_skip),
+        "stats": stats.__dict__,
+        "errors": errors,
+        "examples_extracted": examples_extracted,
+        "examples_skipped": examples_skipped,
+    }
+
+# =========================
+# Summary machinery
+# =========================
+
+@dataclass
+class FolderAgg:
+    lines_scanned: int = 0
+    extracted: int = 0
+    skipped_invalid: int = 0
+    skipped_no_keyword: int = 0
+
+def write_summary(summary_path: Path,
+                  input_root: Path,
+                  output_root: Path,
+                  start_ts: float,
+                  folder_aggs: Dict[str, FolderAgg],
+                  category_counts_extracted: Dict[str, int],
+                  category_counts_skipped: Dict[str, int],
+                  total_files_scanned: int,
+                  blank_files: int,
+                  errors_list: List[str],
+                  examples_extracted: Dict[str, List[Tuple[str, str, str]]],
+                  examples_skipped: Dict[str, List[Tuple[str, str, str]]]
+                  ):
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    total_lines_scanned = sum(a.lines_scanned for a in folder_aggs.values())
+    total_extracted = sum(a.extracted for a in folder_aggs.values())
+    total_skipped_invalid = sum(a.skipped_invalid for a in folder_aggs.values())
+    total_skipped_no_keyword = sum(a.skipped_no_keyword for a in folder_aggs.values())
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("Summary Report - Keyword Extraction\n")
+        f.write(f"Run Completed: {now}\n\n")
+        f.write(f"Input Folder: {input_root}\n")
+        f.write(f"Output Folder: {output_root}\n\n")
+
+        f.write("-------------------------\nOverall Stats\n-------------------------\n")
+        f.write(f"Total Files Scanned         : {total_files_scanned}\n")
+        f.write(f"Total Lines Scanned         : {total_lines_scanned}\n")
+        f.write(f"Total Extracted Lines       : {total_extracted}\n")
+        f.write(f"Total Skipped (Invalid)     : {total_skipped_invalid}\n")
+        f.write(f"Total Skipped (No Keyword)  : {total_skipped_no_keyword}\n")
+        f.write(f"Total Blank Files           : {blank_files}\n")
+        f.write(f"Total Errors                : {len(errors_list)}\n\n")
+
+        f.write("-------------------------\nPer-Folder Stats\n-------------------------\n")
+        for folder in FOLDER_TO_CATEGORY.keys():
+            a = folder_aggs.get(folder, FolderAgg())
+            f.write(f"[{folder}/]\n")
+            f.write(f"Total Lines Scanned   : {a.lines_scanned}\n")
+            f.write(f"Extracted Lines       : {a.extracted}\n")
+            f.write(f"Skipped (Invalid)     : {a.skipped_invalid}\n")
+            f.write(f"Skipped (No Keyword)  : {a.skipped_no_keyword}\n\n")
+
+        f.write("-------------------------\nPer-Category Stats\n-------------------------\n")
+        for cat in FOLDER_TO_CATEGORY.values():
+            ext = category_counts_extracted.get(cat, 0)
+            skp = category_counts_skipped.get(cat, 0)
+            f.write(f"{cat:22s}: {ext} extracted, {skp} skipped\n")
+        f.write("\n")
+
+        f.write("-------------------------\nExamples\n-------------------------\n")
+        for cat, items in examples_extracted.items():
+            if not items:
+                continue
+            f.write(f"[{cat}] (Extracted)\n")
+            for (input_line, field, value) in items[:5]:
+                f.write(f"Input Line: {input_line[:200]}\n")
+                f.write(f"Extracted : {value} (field={field})\n\n")
+
+        for cat, items in examples_skipped.items():
+            if not items:
+                continue
+            f.write(f"[{cat}] (Skipped)\n")
+            for (input_line, field, reason) in items[:5]:
+                f.write(f"Input Line: {input_line[:200]}\n")
+                f.write(f"Skipped   : {reason} (field={field})\n\n")
+
+        f.write("-------------------------\nErrors\n-------------------------\n")
+        if not errors_list:
+            f.write("(No errors logged)\n")
+        else:
+            for e in errors_list[:200]:
+                f.write(e + "\n")
+
+# =========================
+# Discovery helpers
+# =========================
+
+def enumerate_folder_files(input_root: Path) -> Dict[str, List[Path]]:
+    """
+    Return mapping folder_name -> list of .txt files within that subfolder (non-recursive).
+    """
+    result: Dict[str, List[Path]] = {}
+    for folder in FOLDER_TO_CATEGORY.keys():
+        sub = input_root / folder
+        if not sub.exists() or not sub.is_dir():
+            result[folder] = []
+            continue
+        files = sorted([p for p in sub.iterdir() if p.is_file() and p.suffix.lower() in ALLOWED_EXTS])
+        result[folder] = files
+    return result
+
+def append_error(error_path: Path, msg: str):
+    with open(error_path, "a", encoding="utf-8") as ef:
+        ef.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
+
+# =========================
+# Main
+# =========================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Keyword-based extraction with ProcessPool, SQLite resume, chunked outputs, comprehensive summary, and skipped lines."
+    )
+    parser.add_argument("--input", required=True, help="Input root folder containing subfolders: account_number, customer_id, name, dob, address")
+    parser.add_argument("--output", required=True, help="Output root folder (mirrors input subfolders)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_MAX_WORKERS, help="Number of worker processes (default: 6)")
+    parser.add_argument("--force", action="store_true", help="Reprocess all files even if unchanged (ignore SQLite resume)")
+    args = parser.parse_args()
+
+    input_root = Path(args.input).resolve()
+    output_root = Path(args.output).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    db_path = output_root / DB_NAME
+    error_path = output_root / ERROR_LOG
+    summary_path = output_root / SUMMARY_FILENAME
+    resume_log_path = output_root / RESUME_LOG
+
+    conn = ensure_db(db_path)
+
+    folder_specs = compile_folder_specs()
+    folder_files = enumerate_folder_files(input_root)
+
+    # Aggregations
+    folder_aggs: Dict[str, FolderAgg] = {k: FolderAgg() for k in FOLDER_TO_CATEGORY.keys()}
+    category_counts_extracted: Dict[str, int] = Counter()
+    category_counts_skipped: Dict[str, int] = Counter()  # invalid only
+    examples_extracted: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)  # cat -> [(input_line, field, value)]
+    examples_skipped: Dict[str, List[Tuple[str, str, str]]] = defaultdict(list)    # cat -> [(input_line, field, reason)]
+    errors_list: List[str] = []
+    blank_files = 0
+
+    # For output chunking states per folder (extracted + skipped)
+    chunk_states: Dict[str, Dict[str, ChunkState]] = {}
+    for folder in FOLDER_TO_CATEGORY.keys():
+        out_dir = output_root / folder
+        chunk_states[folder] = {
+            "extracted": ChunkState(out_dir=out_dir / "extracted"),
+            "skipped": ChunkState(out_dir=out_dir / "skipped"),
+        }
+
+    # Live summary refresher
+    lock = threading.Lock()
+    start_ts = time.time()
+    total_files_scanned = 0
+    stop_event = threading.Event()
+
+    def refresher():
+        while not stop_event.is_set():
+            with lock:
+                try:
+                    write_summary(summary_path, input_root, output_root, start_ts,
+                                  folder_aggs, category_counts_extracted, category_counts_skipped,
+                                  total_files_scanned, blank_files, errors_list,
+                                  examples_extracted, examples_skipped)
+                except Exception as e:
+                    append_error(error_path, f"[summary_refresh] {type(e).__name__}: {e}")
+            stop_event.wait(30.0)
+
+    t = threading.Thread(target=refresher, daemon=True)
+    t.start()
+
+    # Process per folder
+    try:
+        for folder, files in folder_files.items():
+            spec = folder_specs[folder]
+            category = spec["category"]
+            out_state_ex = chunk_states[folder]["extracted"]
+            out_state_sk = chunk_states[folder]["skipped"]
+
+            if not files:
+                continue
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
+                futures = []
+                for p in files:
+                    try:
+                        mtime, size = file_fingerprint(p)
+                        if (not args.force) and is_already_processed(conn, str(p), mtime, size):
+                            total_files_scanned += 1
+                            if size == 0:
+                                blank_files += 1
+                            continue
+                        futures.append(ex.submit(process_file, str(p), folder, str(output_root), spec))
+                    except Exception as e:
+                        msg = f"[submit] {p}: {type(e).__name__}: {e}"
+                        errors_list.append(msg)
+                        append_error(error_path, msg)
+
+                for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"{folder}"):
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        msg = f"[future] {type(e).__name__}: {e}"
+                        errors_list.append(msg)
+                        append_error(error_path, msg)
+                        continue
+
+                    # Aggregate stats
+                    stats = res["stats"]
+                    folder_aggs[folder].lines_scanned += stats["lines_scanned"]
+                    folder_aggs[folder].extracted += stats["extracted"]
+                    folder_aggs[folder].skipped_invalid += stats["skipped_invalid"]
+                    folder_aggs[folder].skipped_no_keyword += stats["skipped_no_keyword"]
+                    total_files_scanned += 1
+                    if stats["lines_scanned"] == 0:
+                        blank_files += 1
+
+                    # Examples
+                    for (cat, input_line, field, value) in res["examples_extracted"]:
+                        if len(examples_extracted[cat]) < 5:
+                            examples_extracted[cat].append((input_line, field, value))
+                    for (cat, input_line, field, reason) in res["examples_skipped"]:
+                        if len(examples_skipped[cat]) < 5:
+                            examples_skipped[cat].append((input_line, field, reason))
+
+                    # Per-category counters (invalid only goes to skipped invalid)
+                    category_counts_extracted[category] += stats["extracted"]
+                    category_counts_skipped[category] += stats["skipped_invalid"]
+
+                    # Merge worker temp outputs → chunk writers
+                    tmp_ext = Path(res["tmp_ext"])
+                    tmp_skip = Path(res["tmp_skip"])
+                    try:
+                        if tmp_ext.exists():
+                            with tmp_ext.open("r", encoding="utf-8", errors="ignore") as tf:
+                                for out_line in tf:
+                                    out_state_ex.write_line(out_line.rstrip("\n"))
+                            tmp_ext.unlink(missing_ok=True)
+                        if tmp_skip.exists():
+                            with tmp_skip.open("r", encoding="utf-8", errors="ignore") as tf:
+                                for out_line in tf:
+                                    out_state_sk.write_line(out_line.rstrip("\n"))
+                            tmp_skip.unlink(missing_ok=True)
+                    except Exception as e:
+                        msg = f"[merge_tmp] {tmp_ext} / {tmp_skip}: {type(e).__name__}: {e}"
+                        errors_list.append(msg)
+                        append_error(error_path, msg)
+
+                # Mark processed in DB and write resume log
+                for p in files:
+                    try:
+                        mtime, size = file_fingerprint(p)
+                        if args.force or (not is_already_processed(conn, str(p), mtime, size)):
+                            mark_processed(conn, str(p), mtime, size)
+                            with open(resume_log_path, "a", encoding="utf-8") as rlog:
+                                rlog.write(f"{datetime.now().isoformat(timespec='seconds')} PROCESSED {p}\n")
+                    except Exception as e:
+                        msg = f"[mark_processed] {p}: {type(e).__name__}: {e}"
+                        errors_list.append(msg)
+                        append_error(error_path, msg)
+
+            # Close chunk file handles for this folder
+            out_state_ex.close()
+            out_state_sk.close()
+
+    finally:
+        stop_event.set()
+        t.join(timeout=2.0)
+
+    # Final summary write
+    with threading.Lock():
+        write_summary(summary_path, input_root, output_root, start_ts,
+                      folder_aggs, category_counts_extracted, category_counts_skipped,
+                      total_files_scanned, blank_files, errors_list,
+                      examples_extracted, examples_skipped)
+
+    print(f"\nDone. Summary written to: {summary_path}")
+    print(f"DB at: {db_path}")
+    print(f"Errors (if any) at: {error_path}")
+
+if __name__ == "__main__":
+    main()
