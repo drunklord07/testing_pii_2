@@ -1,0 +1,56 @@
+REGEX_PATTERNS = {
+    # Credit/Debit Card numbers
+    "CARD_REGEX": re.compile(
+        r'(?<![A-Za-z0-9])('
+        r'4\d{12}(?:\d{3})?'                                 # Visa
+        r'|5[1-5]\d{14}'                                     # Mastercard (old)
+        r'|2(?:2[2-9]\d{12}|[3-6]\d{13}|7(?:[01]\d{12}|20\d{12}))'  # MC 2-series
+        r'|3[47]\d{13}'                                      # Amex
+        r'|60\d{14}|65\d{14}|81\d{14}|508\d\d{12}'           # RuPay / Discover / others
+        r')(?![A-Za-z0-9])'
+    ),
+
+    # Coordinates: latitude,longitude both required (decimal format)
+    "COORD_REGEX": re.compile(
+        r'(?<![A-Za-z0-9])'
+        r'([+-]?(?:90\.(?:0+)?|[0-8]?\d\.\d+))'             # Latitude
+        r'\s*,\s*'
+        r'([+-]?(?:180\.(?:0+)?|1[0-7]\d\.\d+|[0-9]?\d\.\d+))'  # Longitude
+        r'(?![A-Za-z0-9])'
+    ),
+
+    # Driving License (India) — e.g., "DL0512345678901"
+    "DL_REGEX": re.compile(
+        r'(?<![A-Za-z0-9])[A-Z]{2}\d{2}\d{11}(?![A-Za-z0-9])',
+        re.IGNORECASE
+    ),
+
+    # GSTIN (India) — 15 characters
+    "GSTIN_REGEX": re.compile(
+        r'(?<![A-Za-z0-9])'
+        r'\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]'
+        r'(?![A-Za-z0-9])',
+        re.IGNORECASE
+    ),
+
+    # Email — RFC-lite, TLD >=2
+    "EMAIL_REGEX": re.compile(
+        r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
+        re.IGNORECASE
+    ),
+
+    # IPv4 — strict 0–255 validation
+    "IP_REGEX": re.compile(
+        r'(?<!\d)'
+        r'(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}'
+        r'(?:25[0-5]|2[0-4]\d|1?\d?\d)'
+        r'(?!\d)'
+    ),
+
+    # MAC address — XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
+    "MAC_REGEX": re.compile(
+        r'(?<![A-Fa-f0-9])'
+        r'(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}'
+        r'(?![A-Fa-f0-9])'
+    ),
+}
