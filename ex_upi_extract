@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+UPI regex extractor (India) with:
+- Multiprocess workers writing directly to SQLite (WAL)
+- Live summary refresher (every 30s) reading from DB
+- Resume log + DB 'files_processed' guard
+- Nested JSON backscan field inference
+- Per-line de-duplication by field
+- Truncation of log_line to 1500 chars for both extracted & mirror
+- Examples (up to 3 per field), path-only samples (up to 50 per run)
+- Export phase writes exact 10k-line output files and verifies counts
+- Disk-full and Ctrl+C handling
+"""
+
+import os
+import re
+import sys
+import json
+import uuid
+import argparse
+import traceback
+import threading
+import sqlite3
+import multiprocessing as mp
+from pathlib import Path
+from datetime import datetime
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+
+# ================== CONFIG ================== #
+INPUT_FOLDER    = "input_logs"
+OUTPUT_FOLDER   = "output_upi_regex_sqlite"
+
+MAX_WORKERS     = 6
+SUMMARY_REFRESH_INTERVAL = 30
+
+# Output rotation
+CHUNK_SIZE      = 10_000
+
+# Truncation length for both extracted and mirror rows
+MIRROR_TRUNCATE = 1500
+
+# Nested JSON inference
+NESTED_JSON_DETECT   = True
+FIELD_PATH_MODE      = "full"    # "last" or "full"
+JSON_BACKSCAN_WINDOW = 800
+
+# Examples and samples
+EXAMPLES_PER_FIELD   = 3
+EXAMPLE_MAXLEN       = 500
+PATH_ONLY_MAX        = 50
+
+# Filenames / paths
+OUT_FIELDS_DIR  = Path(OUTPUT_FOLDER) / "fields_identified"
+OUT_MIRROR_DIR  = Path(OUTPUT_FOLDER) / "mirror"
+SUMMARY_FILE    = Path(OUTPUT_FOLDER) / "summary_upi_fields.txt"
+ERRORS_FILE     = Path(OUTPUT_FOLDER) / "errors.log"
+RESUME_LOG      = Path(OUTPUT_FOLDER) / "resume_files.log"
+DB_DIR          = Path(OUTPUT_FOLDER) / "_db"
+# ============================================ #
+
+# Regex: UPI handle (skip emails/domains ending with .com/.in/.co/.org etc.)
+UPI_RE = re.compile(
+    r'(?<![A-Za-z0-9])'                       # no alpha/digit adjacency before
+    r'[A-Za-z0-9._-]{2,15}'                   # UPI ID (shorter cap, max 15 chars before @)
+    r'@'
+    r'(?!gmail\.|yahoo\.|outlook\.|hotmail\.|rediff\.|protonmail\.|zoho\.|icloud\.|aol\.|.*\.com\b|.*\.in\b|.*\.co\b|.*\.org\b)'
+    r'[A-Za-z]{2,64}'                         # PSP handle
+    r'(?![A-Za-z0-9])',                       # no trailing alnum adjacency
+    re.IGNORECASE
+)
+
+# ---------- Utility ----------
+def _safe_trunc(s: str, n: int) -> str:
+    return s if len(s) <= n else (s[:n] + "...TRUNCATED...")
+
+def _log_error(msg: str):
+    try:
+        with open(ERRORS_FILE, "a", encoding="utf-8") as ef:
+            ef.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
+    except Exception:
+        pass
+
+# ---------- Pattern families ----------
+def make_patterns(value_escaped: str):
+    return (
+        # JSON-like: "field" : "value" or 'field' : value
+        re.compile(rf'["\']\s*(?P<field>[^"\']+?)\s*["\']\s*[:=]\s*["\']?(?P<value>{value_escaped})["\']?', re.IGNORECASE),
+        # key=value or key:value
+        re.compile(rf'\b(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*["\']?(?P<value>{value_escaped})["\']?', re.IGNORECASE),
+        # XML attribute: <tag field="value">
+        re.compile(rf'<[^>]*\b(?P<field>[A-Za-z0-9_.\-]+)\s*=\s*["\'](?P<value>{value_escaped})["\'][^>]*>', re.IGNORECASE|re.DOTALL),
+        # XML tag body: <field>value</field>
+        re.compile(rf'<\s*(?P<field>[A-Za-z0-9_.\-]+)[^>]*>[^<]*?(?P<value>{value_escaped})[^<]*?</\s*\1\s*>', re.IGNORECASE|re.DOTALL),
+        # Bracketed: [Field: value]
+        re.compile(rf'\[\s*(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P{ "value" }{value_escaped})\s*\]', re.IGNORECASE),
+        # Mixed curly fragments: {field=value} or {field: value}
+        re.compile(rf'\{{[^}}]*?(?P<field>[A-Za-z0-9_.\-]+)\s*[:=]\s*(?P<value>{value_escaped})(?:[^}}]*?)\}}', re.IGNORECASE),
+        # XML-ish with name attr: <field name="mobile">value</field>
+        re.compile(rf'<[^>]*?\bname\s*=\s*["\']?(?P<field>[A-Za-z0-9_.\-]+)["\']?[^>]*>[^<]*?(?P<value>{value_escaped})[^<]*?</[^>]+>', re.IGNORECASE|re.DOTALL),
+    )
+
+# ---------- Nested JSON helpers ----------
+def _quote_aware_scan_levels(s: str):
+    """Return an array of nesting depths for each position in s, ignoring braces inside strings."""
+    lvl=[0]*(len(s)+1); depth=0; in_str=False; esc=False
+    for i,ch in enumerate(s):
+        if in_str:
+            if esc: esc=False
+            elif ch=='\\': esc=True
+            elif ch=='"': in_str=False
+        else:
+            if ch=='"': in_str=True
+            elif ch in '{[': depth+=1
+            elif ch in '}]' and depth>0: depth-=1
+        lvl[i+1]=depth
+    return lvl
+
+_key_colon_re=re.compile(r'"(?P<k>[^"\\]+)"\s*:')
+
+def _nearest_json_key_for_value(s,val_start,window=400,path_mode="last"):
+    """Heuristic: walk left within window, find nearest enclosing "key": region that plausibly maps to the value."""
+    if val_start<=0: return None
+    L=max(0,val_start-window); slice_s=s[L:val_start]; lvl=_quote_aware_scan_levels(slice_s)
+    cands=[]
+    for m in _key_colon_re.finditer(slice_s):
+        k=m.group('k').strip(); depth=lvl[m.start()]
+        cands.append((m.start(),m.end(),depth,k))
+    if not cands: return None
+    best_key=None; best_depth=-1
+    for start_idx, after_colon, key_depth, key in reversed(cands):
+        base=lvl[start_idx]; cut=False
+        for i in range(after_colon,len(slice_s)):
+            if slice_s[i]==',' and lvl[i]==base and (L+i)<val_start: cut=True; break
+            if slice_s[i] in '}]' and lvl[i+1]<base and (L+i)<val_start: cut=True; break
+        if not cut:
+            best_key=key; best_depth=key_depth; break
+    if best_key is None: return None
+    if path_mode=="last": return best_key
+    path=[best_key]; target=best_depth
+    for start_idx, after_colon, key_depth, key in reversed(cands):
+        if key_depth<target:
+            path.append(key); target=key_depth
+    path.reverse(); return ".".join(path)
+
+def identify_field_for_value(log_line: str, value: str):
+    """Try to infer a field name for a matched value using several pattern families + nested JSON backscan."""
+    val_esc = re.escape(value)
+    for pat in make_patterns(val_esc):
+        m = pat.search(log_line)
+        if m:
+            fld = m.group("field").strip()
+            if fld: return fld
+    if NESTED_JSON_DETECT:
+        idx = log_line.find(value)
+        if idx != -1:
+            fld = _nearest_json_key_for_value(log_line, idx, JSON_BACKSCAN_WINDOW, FIELD_PATH_MODE)
+            if fld: return fld
+    return None
+
+# ---------- SQLite schema / helpers ----------
+def db_path_for_run(run_id: str) -> Path:
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    return DB_DIR / f"run_{run_id}.sqlite3"
+
+CREATE_SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA temp_store=MEMORY;
+PRAGMA wal_autocheckpoint=1000;
+CREATE TABLE IF NOT EXISTS rows_extracted (
+  run_id TEXT,
+  short_log TEXT,
+  file_path TEXT,
+  field TEXT,
+  regex_name TEXT,
+  value TEXT
+);
+CREATE TABLE IF NOT EXISTS rows_mirror (
+  run_id TEXT,
+  short_log TEXT,
+  file_path TEXT,
+  regex_name TEXT,
+  value TEXT
+);
+CREATE TABLE IF NOT EXISTS stats_shards (
+  run_id TEXT,
+  key TEXT,
+  value INTEGER
+);
+CREATE TABLE IF NOT EXISTS examples (
+  run_id TEXT,
+  field TEXT,
+  example TEXT
+);
+CREATE TABLE IF NOT EXISTS path_only_samples (
+  run_id TEXT,
+  sample TEXT
+);
+CREATE TABLE IF NOT EXISTS files_processed (
+  run_id TEXT,
+  file_path TEXT PRIMARY KEY,
+  ok INTEGER,
+  err TEXT,
+  ts TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_extracted_run ON rows_extracted(run_id);
+CREATE INDEX IF NOT EXISTS idx_extracted_field ON rows_extracted(run_id, field);
+CREATE INDEX IF NOT EXISTS idx_mirror_run ON rows_mirror(run_id);
+CREATE INDEX IF NOT EXISTS idx_stats_run ON stats_shards(run_id);
+CREATE INDEX IF NOT EXISTS idx_examples_run ON examples(run_id, field);
+"""
+
+def db_connect(db_path: Path):
+    conn = sqlite3.connect(str(db_path), timeout=60, isolation_level=None)  # autocommit
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA wal_autocheckpoint=1000;")
+    return conn
+
+def db_init(conn: sqlite3.Connection):
+    conn.executescript(CREATE_SCHEMA)
+
+def db_sum(conn: sqlite3.Connection, run_id: str, key: str) -> int:
+    cur = conn.execute("SELECT COALESCE(SUM(value),0) FROM stats_shards WHERE run_id=? AND key=?", (run_id, key))
+    return int(cur.fetchone()[0])
+
+# ---------- resume helpers ----------
+def load_resume_set() -> set:
+    if RESUME_LOG.exists():
+        try:
+            return set(p.strip() for p in RESUME_LOG.read_text(encoding="utf-8", errors="ignore").splitlines() if p.strip())
+        except Exception:
+            return set()
+    return set()
+
+def append_resume(path_str: str):
+    try:
+        with open(RESUME_LOG, "a", encoding="utf-8") as f:
+            f.write(path_str + "\n")
+    except Exception:
+        pass
+
+# ---------- worker ----------
+def process_file(path: Path, run_id: str, dbp: str):
+    stats = defaultdict(int)
+    per_field_examples = defaultdict(list)
+    path_only_samples_local = []
+
+    disk_full = False
+    try:
+        conn = db_connect(Path(dbp))
+        cur = conn.cursor()
+        # Batch containers
+        extracted_batch = []
+        mirror_batch = []
+
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+
+                if ";" in line:
+                    log_line, file_path = line.rsplit(";", 1)
+                else:
+                    log_line, file_path = line, ""
+
+                matches = list(UPI_RE.finditer(line))
+                if not matches:
+                    stats["lines_no_regex"] += 1
+                    continue
+
+                split_at = len(log_line)
+                log_matches  = [m for m in matches if m.start() < split_at]
+                path_matches = [m for m in matches if m.start() >= split_at]
+
+                stats["total_regex_matches"] += len(matches)
+
+                if not log_matches and path_matches:
+                    stats["dropped_path_only_matches"] += len(path_matches)
+                    if len(path_only_samples_local) < PATH_ONLY_MAX:
+                        path_only_samples_local.append(line)
+                    continue
+
+                seen_fields = set()
+                unidentified_first = None
+
+                for m in log_matches:
+                    upi = m.group(0)
+                    fld = identify_field_for_value(log_line, upi)
+
+                    if fld:
+                        norm = fld.strip().lower()
+                        if norm not in seen_fields:
+                            short = log_line if len(log_line)<=MIRROR_TRUNCATE else (log_line[:MIRROR_TRUNCATE]+"...TRUNCATED...")
+                            extracted_batch.append((run_id, short, file_path, fld, "upi_regex", upi))
+                            stats["extracted_rows"] += 1
+                            if len(per_field_examples[fld]) < EXAMPLES_PER_FIELD:
+                                per_field_examples[fld].append(f"{short} ; {file_path} ; {fld} ; upi_regex ; {upi}")
+                            seen_fields.add(norm)
+                    else:
+                        if unidentified_first is None:
+                            unidentified_first = upi
+
+                if unidentified_first:
+                    short = log_line if len(log_line)<=MIRROR_TRUNCATE else (log_line[:MIRROR_TRUNCATE]+"...TRUNCATED...")
+                    mirror_batch.append((run_id, short, file_path, "upi_regex", unidentified_first))
+                    stats["mirror_rows"] += 1
+
+                # Flush periodically to DB (keeps transactions short)
+                if len(extracted_batch) >= 2000:
+                    cur.execute("BEGIN IMMEDIATE")
+                    cur.executemany("INSERT INTO rows_extracted(run_id,short_log,file_path,field,regex_name,value) VALUES (?,?,?,?,?,?)", extracted_batch)
+                    conn.commit(); extracted_batch.clear()
+                if len(mirror_batch) >= 2000:
+                    cur.execute("BEGIN IMMEDIATE")
+                    cur.executemany("INSERT INTO rows_mirror(run_id,short_log,file_path,regex_name,value) VALUES (?,?,?,?,?)", mirror_batch)
+                    conn.commit(); mirror_batch.clear()
+
+        # final flush
+        if extracted_batch:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.executemany("INSERT INTO rows_extracted(run_id,short_log,file_path,field,regex_name,value) VALUES (?,?,?,?,?,?)", extracted_batch)
+            conn.commit()
+        if mirror_batch:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.executemany("INSERT INTO rows_mirror(run_id,short_log,file_path,regex_name,value) VALUES (?,?,?,?,?)", mirror_batch)
+            conn.commit()
+
+        # write stats into DB
+        kvs = (
+            ("total_regex_matches", stats.get("total_regex_matches",0)),
+            ("dropped_path_only_matches", stats.get("dropped_path_only_matches",0)),
+            ("lines_no_regex", stats.get("lines_no_regex",0)),
+            ("extracted_rows", stats.get("extracted_rows",0)),
+            ("mirror_rows", stats.get("mirror_rows",0)),
+            ("partial_valid_lines", stats.get("partial_valid_lines",0)),
+        )
+        cur.execute("BEGIN IMMEDIATE")
+        for k,v in kvs:
+            cur.execute("INSERT INTO stats_shards(run_id,key,value) VALUES (?,?,?)", (run_id,k,int(v)))
+        # examples
+        for fld, lst in per_field_examples.items():
+            for ex in lst[:EXAMPLES_PER_FIELD]:
+                cur.execute("INSERT INTO examples(run_id,field,example) VALUES (?,?,?)", (run_id, fld, _safe_trunc(ex, EXAMPLE_MAXLEN)))
+        # path-only samples
+        for s in path_only_samples_local[:PATH_ONLY_MAX]:
+            cur.execute("INSERT INTO path_only_samples(run_id,sample) VALUES (?,?)", (run_id, _safe_trunc(s, EXAMPLE_MAXLEN)))
+        # file processed
+        cur.execute("INSERT OR REPLACE INTO files_processed(run_id,file_path,ok,err,ts) VALUES (?,?,?,?,?)",
+                    (run_id, str(path), 1, "", datetime.now().isoformat(timespec='seconds')))
+        conn.commit()
+        cur.close(); conn.close()
+
+    except sqlite3.OperationalError as e:
+        if "database or disk is full" in str(e).lower():
+            disk_full = True
+        _log_error(f"{path}: sqlite OperationalError: {e}\n{traceback.format_exc()}")
+    except OSError as e:
+        if getattr(e,"errno",None) == 28:   # no space left
+            disk_full = True
+        _log_error(f"{path}: OSError: {e}\n{traceback.format_exc()}")
+    except Exception as e:
+        _log_error(f"{path}: {e}\n{traceback.format_exc()}")
+        # best-effort: mark file failed
+        try:
+            conn = db_connect(Path(dbp))
+            conn.execute("INSERT OR REPLACE INTO files_processed(run_id,file_path,ok,err,ts) VALUES (?,?,?,?,?)",
+                         (run_id, str(path), 0, str(e)[:300], datetime.now().isoformat(timespec='seconds')))
+            conn.commit(); conn.close()
+        except Exception:
+            pass
+
+    return (bool(disk_full), str(path))
+
+# ---------- live summary ----------
+def write_summary(conn: sqlite3.Connection, input_dir: Path, run_id: str, stage: str):
+    # file counts
+    cur = conn.execute("SELECT COUNT(*) FROM files_processed WHERE run_id=?", (run_id,))
+    files_seen = int(cur.fetchone()[0] or 0)
+    cur = conn.execute("SELECT SUM(ok) FROM files_processed WHERE run_id=?", (run_id,))
+    files_ok = int(cur.fetchone()[0] or 0)
+    files_failed = files_seen - files_ok
+
+    # counts
+    raw_total      = db_sum(conn, run_id, "total_regex_matches")
+    dropped_path   = db_sum(conn, run_id, "dropped_path_only_matches")
+    lines_no_regex = db_sum(conn, run_id, "lines_no_regex")
+    extr_rows      = db_sum(conn, run_id, "extracted_rows")
+    mirr_rows      = db_sum(conn, run_id, "mirror_rows")
+    partial_lines  = db_sum(conn, run_id, "partial_valid_lines")
+
+    consistency_ok = (extr_rows + mirr_rows + dropped_path) == raw_total
+    dedup_discarded = raw_total - (extr_rows + mirr_rows + dropped_path)
+
+    # per-field counts & examples
+    field_counts = list(conn.execute(
+        "SELECT field, COUNT(*) c FROM rows_extracted WHERE run_id=? GROUP BY field ORDER BY c DESC, field ASC",
+        (run_id,))
+    )
+    examples = defaultdict(list)
+    for fld, ex in conn.execute(
+        "SELECT field, example FROM examples WHERE run_id=?",
+        (run_id,)
+    ):
+        if len(examples[fld]) < EXAMPLES_PER_FIELD:
+            examples[fld].append(ex)
+
+    # path-only samples
+    path_samples = [row[0] for row in conn.execute(
+        "SELECT sample FROM path_only_samples WHERE run_id=? LIMIT ?", (run_id, PATH_ONLY_MAX)
+    )]
+
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as sf:
+        sf.write(f"Summary ({stage}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | RUN_ID={run_id}\n")
+        sf.write("="*60 + "\n\n")
+        sf.write("INPUT / OUTPUT\n")
+        sf.write(f"Input folder: {input_dir.resolve()}\n")
+        sf.write(f"Output folder: {Path(OUTPUT_FOLDER).resolve()}\n")
+        sf.write(f"Fields Identified (chunk {CHUNK_SIZE}): {OUT_FIELDS_DIR.resolve()}\n")
+        sf.write(f"Mirror (chunk {CHUNK_SIZE}): {OUT_MIRROR_DIR.resolve()}\n")
+        sf.write(f"Truncation: first {MIRROR_TRUNCATE} chars of log_line (both extracted & mirror)\n\n")
+
+        sf.write("FILE COUNTS\n")
+        sf.write(f"Files processed successfully: {files_ok}\n")
+        sf.write(f"Files failed: {files_failed}\n\n")
+
+        sf.write("COUNTS\n")
+        sf.write(f"Total regex matches (raw): {raw_total}\n")
+        sf.write(f"  Extracted rows (kept):   {extr_rows}\n")
+        sf.write(f"  Mirrored rows:           {mirr_rows}\n")
+        sf.write(f"  Dropped (path-only):     {dropped_path}\n")
+        sf.write(f"  Duplicates discarded:    {dedup_discarded}\n")
+        sf.write(f"Lines with no regex at all (dropped lines): {lines_no_regex}\n")
+        sf.write(f"Partial-valid lines: {partial_lines}\n")
+        sf.write(f"Consistency check: {consistency_ok}\n\n")
+
+        sf.write("PER-FIELD COUNTS (extracted)\n")
+        for fld, cnt in field_counts:
+            sf.write(f"{fld} = {cnt}\n")
+            for ex in examples.get(fld, []):
+                sf.write(f"  Example: {ex}\n")
+        sf.write("\n")
+
+        sf.write("SAMPLE PATH-ONLY LINES\n")
+        if path_samples:
+            for i, ln in enumerate(path_samples, 1):
+                sf.write(f"{i}. {ln}\n")
+        else:
+            sf.write("(none)\n")
+        sf.write("\n")
+
+        sf.write("NOTES\n")
+        sf.write("- One extracted row per unique field per line (per-line dedup).\n")
+        sf.write("- At most one mirror row per line (if any unidentified field present).\n")
+        sf.write("- Nested JSON key-path inference is enabled.\n")
+        sf.write("- Export creates exact 10k-line files with verification.\n")
+
+def summary_refresher(dbp: Path, input_dir: Path, run_id: str, stop_event: threading.Event):
+    conn = db_connect(dbp)
+    try:
+        while not stop_event.is_set():
+            try:
+                write_summary(conn, input_dir, run_id, stage="Live")
+            except Exception as e:
+                _log_error(f"summary_refresher: {e}\n{traceback.format_exc()}")
+            stop_event.wait(SUMMARY_REFRESH_INTERVAL)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+# ---------- exporter (DB → files, exact 10k lines per file) ----------
+def export_table_to_chunked_files(conn: sqlite3.Connection, run_id: str, table: str,
+                                  out_dir: Path, prefix: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Count expected rows
+    cur = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?", (run_id,))
+    expected = int(cur.fetchone()[0] or 0)
+
+    written = 0
+    file_index = 1
+    lines_in_current = 0
+    out_path = out_dir / f"{prefix}_{file_index:03d}.txt"
+    out_fh = out_path.open("w", encoding="utf-8")
+
+    # Stream by rowid (fast pagination without OFFSET)
+    last_rowid = 0
+    BATCH = 50000
+    if table == "rows_extracted":
+        cols = "rowid, short_log, file_path, field, regex_name, value"
+    else:
+        cols = "rowid, short_log, file_path, regex_name, value"
+
+    try:
+        while True:
+            q = f"SELECT {cols} FROM {table} WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?"
+            rows = list(conn.execute(q, (run_id, last_rowid, BATCH)))
+            if not rows:
+                break
+            for row in rows:
+                last_rowid = row[0]
+                if table == "rows_extracted":
+                    _, short, file_path, field, regex_name, value = row
+                    line = f"{short} ; {file_path} ; {field} ; {regex_name} ; {value}\n"
+                else:
+                    _, short, file_path, regex_name, value = row
+                    line = f"{short} ; {file_path} ; UNIDENTIFIED_FIELD ; {regex_name} ; {value}\n"
+                out_fh.write(line)
+                written += 1
+                lines_in_current += 1
+                if lines_in_current >= CHUNK_SIZE:
+                    out_fh.close()
+                    file_index += 1
+                    lines_in_current = 0
+                    out_fh = (out_dir / f"{prefix}_{file_index:03d}.txt").open("w", encoding="utf-8")
+    finally:
+        try:
+            if not out_fh.closed:
+                out_fh.close()
+        except Exception:
+            pass
+
+    return written, expected
+
+def export_all(conn: sqlite3.Connection, run_id: str):
+    w1, e1 = export_table_to_chunked_files(conn, run_id, "rows_extracted", OUT_FIELDS_DIR, "extracted")
+    w2, e2 = export_table_to_chunked_files(conn, run_id, "rows_mirror", OUT_MIRROR_DIR, "mirror")
+    ok = (w1 == e1) and (w2 == e2)
+    if not ok:
+        _log_error(f"export_verify_mismatch: extracted wrote={w1}, expected={e1}; mirror wrote={w2}, expected={e2}")
+    return ok, (w1, e1, w2, e2)
+
+# ---------- CLI ----------
+def parse_args():
+    ap = argparse.ArgumentParser(description="UPI extractor with SQLite (no shards).")
+    ap.add_argument("--run-id", type=str, default=None, help="Set a run id (hex). Auto-generated if not provided.")
+    ap.add_argument("--export-only", action="store_true", help="Export files from DB only (do not process logs).")
+    ap.add_argument("--merge-only", action="store_true", help="Alias of --export-only.")
+    ap.add_argument("--no-resume", action="store_true", default=False, help=argparse.SUPPRESS)
+    return ap.parse_args()
+
+# ---------- main ----------
+def main():
+    args = parse_args()
+
+    input_dir = Path(INPUT_FOLDER)
+    if not input_dir.exists():
+        print(f"Input folder not found: {input_dir.resolve()}")
+        sys.exit(1)
+
+    Path(OUTPUT_FOLDER).mkdir(parents=True, exist_ok=True)
+    OUT_FIELDS_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_MIRROR_DIR.mkdir(parents=True, exist_ok=True)
+    ERRORS_FILE.touch(exist_ok=True)
+
+    run_id = args.run_id or uuid.uuid4().hex
+    dbp = db_path_for_run(run_id)
+
+    # Export-only mode
+    if args.export_only or args.merge_only:
+        conn = db_connect(dbp); db_init(conn)
+        ok, counts = export_all(conn, run_id)
+        write_summary(conn, input_dir, run_id, stage="Final" if ok else "Export Mismatch")
+        conn.close()
+        if ok:
+            print("\n✅ Export complete.")
+        else:
+            print("\n⚠️  Export finished with mismatch. Check errors.log.")
+        print(f"RUN_ID:  {run_id}")
+        print(f"Summary: {SUMMARY_FILE.resolve()}")
+        return
+
+    # Fresh DB
+    conn_main = db_connect(dbp); db_init(conn_main)
+
+    # Resume: skip already processed files (both text log and DB)
+    resume_set = set() if args.no_resume else load_resume_set()
+    db_done = set(r[0] for r in conn_main.execute("SELECT file_path FROM files_processed WHERE run_id=? AND ok=1", (run_id,)))
+    already = resume_set | db_done
+
+    files = [p for p in input_dir.rglob("*.txt")]
+    pending = [p for p in files if str(p) not in already]
+    files_total = len(files)
+
+    # Live refresher
+    stop_event = threading.Event()
+    refresher = threading.Thread(target=summary_refresher, args=(dbp, input_dir, run_id, stop_event), daemon=True)
+    refresher.start()
+
+    ctx = mp.get_context("spawn")
+    disk_full = False
+    files_processed = 0
+    failed_files = []
+
+    try:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as ex:
+            futures = {ex.submit(process_file, p, run_id, str(dbp)): p for p in pending}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
+                try:
+                    df, pth = fut.result()
+                    if df: disk_full = True
+                    if df:
+                        failed_files.append(pth)
+                    else:
+                        files_processed += 1
+                        append_resume(pth)
+                    if disk_full:
+                        break
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    failed_files.append(str(futures[fut]))
+                    _log_error(f"worker result error: {e}\n{traceback.format_exc()}")
+    except KeyboardInterrupt:
+        print("\n^C detected — stopping…")
+    finally:
+        stop_event.set(); refresher.join(timeout=2)
+
+    if disk_full:
+        write_summary(conn_main, input_dir, run_id, stage="Aborted (Disk Full)")
+        conn_main.close()
+        print("\n❌ Aborted: No space left on device. Re-run --export-only after freeing space.")
+        print(f"RUN_ID:  {run_id}\nSummary: {SUMMARY_FILE.resolve()}")
+        sys.exit(2)
+
+    # Export & final summary
+    ok, counts = export_all(conn_main, run_id)
+    write_summary(conn_main, input_dir, run_id, stage="Final" if ok else "Export Mismatch")
+    conn_main.close()
+
+    if ok:
+        print("\n✅ Done.")
+    else:
+        print("\n⚠️  Done with EXPORT VERIFICATION MISMATCH — check errors.log.")
+    print(f"RUN_ID:   {run_id}")
+    print(f"Extracted: {OUT_FIELDS_DIR.resolve()}")
+    print(f"Mirror:    {OUT_MIRROR_DIR.resolve()}")
+    print(f"Summary:   {SUMMARY_FILE.resolve()}")
+    if not ok or failed_files:
+        print(f"Errors:    {ERRORS_FILE.resolve()}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("Fatal error:", e)
+        print(traceback.format_exc())
