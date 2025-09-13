@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import sys
+import traceback
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import Counter
+from datetime import datetime
+from tqdm import tqdm
+
+# ========== CONFIGURATION ==========
+CHUNK_SIZE = 10000
+MAX_WORKERS = 6
+OUTPUT_FOLDER = "output_users"
+SUMMARY_FILE = "summary_users.txt"
+ALLOWED_EXTS = (".txt",)
+# Regex to match , users=[....],
+USERS_REGEX = re.compile(r",\s*users=\[(\d{10,12})(?:[^\]]*)\],")
+# ===================================
+
+def find_txt_files(root: Path):
+    return sorted([p for p in root.rglob("*") if p.suffix in ALLOWED_EXTS])
+
+def extract_users_line(line: str, path: str):
+    """
+    Extracts the first users=[<number>] from the line.
+    Returns formatted output line or None if not found.
+    """
+    m = USERS_REGEX.search(line)
+    if not m:
+        return None
+    number = m.group(1)
+    extracted = f"users=[{number}] ; {path} ; users ; MOBILE_REGEX ; {number}"
+    return extracted, number
+
+def process_file(file_path: Path):
+    stats = {
+        "lines_scanned": 0,
+        "lines_written": 0,
+        "numbers": Counter(),
+        "error": None,
+        "blank": False
+    }
+    outputs = []
+    try:
+        with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                stats["lines_scanned"] += 1
+                res = extract_users_line(line, str(file_path))
+                if res:
+                    formatted, number = res
+                    outputs.append(formatted)
+                    stats["lines_written"] += 1
+                    stats["numbers"][number] += 1
+        if stats["lines_scanned"] == 0:
+            stats["blank"] = True
+    except Exception as e:
+        stats["error"] = f"{file_path}: {e}"
+    return file_path, outputs, stats
+
+def write_chunks(outputs, base_name, out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    chunk_idx = 1
+    line_count = 0
+    writer = None
+
+    for line in outputs:
+        if writer is None or line_count >= CHUNK_SIZE:
+            if writer:
+                writer.close()
+            chunk_file = out_dir / f"{base_name}_chunk{chunk_idx:04d}.txt"
+            writer = chunk_file.open("w", encoding="utf-8")
+            chunk_idx += 1
+            line_count = 0
+        writer.write(line + "\n")
+        line_count += 1
+    if writer:
+        writer.close()
+
+def write_summary(summary, numbers_counter):
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write(f"Summary Report - users extractor\n")
+        f.write(f"Generated: {datetime.now()}\n\n")
+        f.write(f"Input folder       : {summary['input']}\n")
+        f.write(f"Output folder      : {OUTPUT_FOLDER}\n")
+        f.write(f"Files scanned      : {summary['files_scanned']}\n")
+        f.write(f"Total lines scanned: {summary['lines_scanned']}\n")
+        f.write(f"Total numbers found: {summary['total_found']}\n")
+        f.write(f"Total lines written: {summary['lines_written']}\n")
+        f.write(f"Lines skipped (no match): {summary['lines_skipped']}\n")
+        f.write(f"Blank files        : {summary['blank_files']}\n")
+        f.write(f"Errors             : {len(summary['errors'])}\n")
+        if summary['errors']:
+            f.write("Error details:\n")
+            for e in summary['errors']:
+                f.write(f"  - {e}\n")
+        f.write("\nPer-number frequency:\n")
+        for num, count in numbers_counter.most_common():
+            f.write(f"  {num} : {count}\n")
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python extract_users.py <input_folder>")
+        sys.exit(1)
+    input_folder = Path(sys.argv[1])
+    if not input_folder.exists():
+        print(f"Input folder not found: {input_folder}")
+        sys.exit(1)
+
+    txt_files = find_txt_files(input_folder)
+    summary = {
+        "input": str(input_folder),
+        "files_scanned": 0,
+        "lines_scanned": 0,
+        "total_found": 0,
+        "lines_written": 0,
+        "lines_skipped": 0,
+        "blank_files": 0,
+        "errors": []
+    }
+    numbers_counter = Counter()
+    all_outputs = []
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(process_file, f): f for f in txt_files}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+            fpath, outputs, stats = fut.result()
+            summary["files_scanned"] += 1
+            summary["lines_scanned"] += stats["lines_scanned"]
+            summary["lines_written"] += stats["lines_written"]
+            summary["total_found"] += sum(stats["numbers"].values())
+            summary["lines_skipped"] += stats["lines_scanned"] - stats["lines_written"]
+            if stats["blank"]:
+                summary["blank_files"] += 1
+            if stats["error"]:
+                summary["errors"].append(stats["error"])
+            numbers_counter.update(stats["numbers"])
+            if outputs:
+                base = fpath.stem
+                out_dir = Path(OUTPUT_FOLDER)
+                write_chunks(outputs, base, out_dir)
+
+    write_summary(summary, numbers_counter)
+    print(f"\nDone. Summary written to {SUMMARY_FILE}")
+
+if __name__ == "__main__":
+    main()
