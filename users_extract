@@ -12,13 +12,15 @@ from datetime import datetime
 from tqdm import tqdm
 
 # ========== CONFIGURATION ==========
-CHUNK_SIZE = 10000
-MAX_WORKERS = 6
+INPUT_FOLDER = "input_logs"         # <-- Hardcode your folder here
 OUTPUT_FOLDER = "output_users"
 SUMMARY_FILE = "summary_users.txt"
+CHUNK_SIZE = 10000
+MAX_WORKERS = 6
 ALLOWED_EXTS = (".txt",)
-# Regex to match , users=[....],
-USERS_REGEX = re.compile(r",\s*users=\[(\d{10,12})(?:[^\]]*)\],")
+
+# Match users=[<10–12 digit number>] with optional spaces/commas around
+USERS_REGEX = re.compile(r"users=\[(\d{10,12})\]")
 # ===================================
 
 def find_txt_files(root: Path):
@@ -33,6 +35,7 @@ def extract_users_line(line: str, path: str):
     if not m:
         return None
     number = m.group(1)
+    # Only include users=[...] in the "logline" part
     extracted = f"users=[{number}] ; {path} ; users ; MOBILE_REGEX ; {number}"
     return extracted, number
 
@@ -103,10 +106,7 @@ def write_summary(summary, numbers_counter):
             f.write(f"  {num} : {count}\n")
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python extract_users.py <input_folder>")
-        sys.exit(1)
-    input_folder = Path(sys.argv[1])
+    input_folder = Path(INPUT_FOLDER)
     if not input_folder.exists():
         print(f"Input folder not found: {input_folder}")
         sys.exit(1)
@@ -123,7 +123,6 @@ def main():
         "errors": []
     }
     numbers_counter = Counter()
-    all_outputs = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(process_file, f): f for f in txt_files}
