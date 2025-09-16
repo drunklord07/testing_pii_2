@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+"""
+Simple Aadhaar validator:
+- Scans all *.txt files under INPUT_FOLDER (recursive)
+- Extracts 12-digit candidates (not embedded in longer numbers)
+- Validates with Verhoeff checksum
+- Writes a single report TXT into OUTPUT_FOLDER
+"""
+
 import re
 import sys
 import traceback
 from pathlib import Path
 from functools import lru_cache
 
-# ========== Aadhaar Verhoeff Check ==========
+# ========== CONFIGURE ONLY THESE ==========
+INPUT_FOLDER  = "input_logs"        # <-- put your input folder path here
+OUTPUT_FOLDER = "aadhaar_output"    # <-- output folder to create/write report
+REPORT_NAME   = "aadhaar_report.txt"
+# ==========================================
+
+# ---------- Aadhaar Verhoeff ----------
 @lru_cache(maxsize=10000)
 def is_valid_aadhaar(number: str) -> bool:
     if len(number) != 12 or not number.isdigit():
@@ -41,62 +54,66 @@ def is_valid_aadhaar(number: str) -> bool:
         c = mul[c][perm[i % 8][int(ch)]]
     return inv[c] == 0
 
-# ========== Main Script ==========
 def main():
-    input_folder = input("Enter input folder path: ").strip()
-    in_path = Path(input_folder)
-    if not in_path.exists():
-        print(f"❌ Input folder not found: {in_path}")
+    in_path = Path(INPUT_FOLDER)
+    out_path = Path(OUTPUT_FOLDER)
+    report_path = out_path / REPORT_NAME
+
+    if not in_path.exists() or not in_path.is_dir():
+        print(f"❌ INPUT_FOLDER not found or not a directory: {in_path}")
         sys.exit(1)
 
-    output_folder = Path("output")
-    output_folder.mkdir(exist_ok=True)
-    report_file = output_folder / "aadhaar_report.txt"
+    out_path.mkdir(parents=True, exist_ok=True)
 
-    aadhaar_pattern = re.compile(r"\b\d{12}\b")
+    # 12 digits, not embedded within other digits
+    aadhaar_pattern = re.compile(r'(?<!\d)\d{12}(?!\d)')
 
-    total_found = 0
+    files_scanned = 0
+    total_candidates = 0
     total_valid = 0
     total_invalid = 0
-    per_file_stats = []
+    per_file = []
 
-    for txt_file in sorted(in_path.rglob("*.txt")):
-        file_found = 0
-        file_valid = 0
-        file_invalid = 0
+    for txt in sorted(in_path.rglob("*.txt")):
+        files_scanned += 1
+        f_found = f_valid = f_invalid = 0
 
         try:
-            with txt_file.open("r", encoding="utf-8", errors="ignore") as f:
+            with txt.open("r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    for match in aadhaar_pattern.findall(line):
-                        total_found += 1
-                        file_found += 1
-                        if is_valid_aadhaar(match):
+                    for num in aadhaar_pattern.findall(line):
+                        total_candidates += 1
+                        f_found += 1
+                        if is_valid_aadhaar(num):
                             total_valid += 1
-                            file_valid += 1
+                            f_valid += 1
                         else:
                             total_invalid += 1
-                            file_invalid += 1
-        except Exception as e:
+                            f_invalid += 1
+        except Exception:
             traceback.print_exc()
+            per_file.append(f"{txt}: ERROR while reading (counted as 0/0/0)")
             continue
 
-        per_file_stats.append(
-            f"{txt_file.name}: found={file_found}, valid={file_valid}, invalid={file_invalid}"
+        per_file.append(
+            f"{txt} -> candidates={f_found}, valid={f_valid}, invalid={f_invalid}"
         )
 
-    # ===== Write Report =====
-    with report_file.open("w", encoding="utf-8") as rf:
+    with report_path.open("w", encoding="utf-8") as rf:
         rf.write("===== Aadhaar Validation Report =====\n\n")
-        rf.write(f"Total Aadhaar candidates found: {total_found}\n")
-        rf.write(f"Valid Aadhaar numbers: {total_valid}\n")
-        rf.write(f"Invalid Aadhaar numbers: {total_invalid}\n\n")
+        rf.write(f"Input folder   : {in_path}\n")
+        rf.write(f"Output folder  : {out_path}\n")
+        rf.write(f"Files scanned  : {files_scanned}\n\n")
 
-        rf.write("----- Per File Stats -----\n")
-        for stat in per_file_stats:
-            rf.write(stat + "\n")
+        rf.write(f"Total candidates (12-digit): {total_candidates}\n")
+        rf.write(f"Valid Aadhaar              : {total_valid}\n")
+        rf.write(f"Invalid Aadhaar            : {total_invalid}\n\n")
 
-    print(f"✅ Report written to: {report_file}")
+        rf.write("----- Per-file breakdown -----\n")
+        for row in per_file:
+            rf.write(row + "\n")
+
+    print(f"✅ Report written: {report_path}")
 
 if __name__ == "__main__":
     main()
