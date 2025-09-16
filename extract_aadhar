@@ -2,24 +2,38 @@
 # -*- coding: utf-8 -*-
 
 """
-Simple Aadhaar validator:
-- Scans all *.txt files under INPUT_FOLDER (recursive)
-- Extracts 12-digit candidates (not embedded in longer numbers)
-- Validates with Verhoeff checksum
-- Writes a single report TXT into OUTPUT_FOLDER
+Aadhaar-based line cleaner
+--------------------------
+Rules:
+- For each line in each *.txt file under INPUT_FOLDER (recursive):
+  * Extract 12-digit candidates not embedded in longer numbers.
+  * If ANY candidate fails Aadhaar Verhoeff checksum => DROP the entire line.
+  * Else (no candidates OR all candidates valid) => KEEP the line.
+- Write kept lines into OUTPUT_FOLDER as chunked files of CHUNK_LINES lines each:
+  chunk0001.txt, chunk0002.txt, ...
+- Produce a summary_report.txt in OUTPUT_FOLDER.
+
+Configuration is at the top. No temp files. Parallel file reads (threads).
 """
 
+import os
 import re
 import sys
 import traceback
 from pathlib import Path
+from typing import Dict, List, Tuple
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 # ========== CONFIGURE ONLY THESE ==========
-INPUT_FOLDER  = "input_logs"        # <-- put your input folder path here
-OUTPUT_FOLDER = "aadhaar_output"    # <-- output folder to create/write report
-REPORT_NAME   = "aadhaar_report.txt"
+INPUT_FOLDER   = "input_logs"          # <-- your input folder path
+OUTPUT_FOLDER  = "aadhaar_cleaned"     # <-- output folder (created if missing)
+CHUNK_LINES    = 10000                 # <-- lines per output file
+MAX_WORKERS    = 6                     # <-- parallel readers (I/O bound)
+REPORT_NAME    = "summary_report.txt"  # <-- name of summary file
 # ==========================================
+
 
 # ---------- Aadhaar Verhoeff ----------
 @lru_cache(maxsize=10000)
@@ -54,6 +68,128 @@ def is_valid_aadhaar(number: str) -> bool:
         c = mul[c][perm[i % 8][int(ch)]]
     return inv[c] == 0
 
+
+# ---------- Core logic ----------
+AADHAAR_RE = re.compile(r'(?<!\d)\d{12}(?!\d)')  # exact 12 digits, not embedded
+
+
+def should_keep_line(line: str) -> Tuple[bool, int, int]:
+    """
+    Returns (keep_line, valid_count, invalid_count) for the line.
+    Rule: if any invalid Aadhaar found -> drop line (keep_line=False)
+          else keep (True). If no candidates, keep.
+    """
+    candidates = AADHAAR_RE.findall(line)
+    if not candidates:
+        return True, 0, 0
+
+    valid, invalid = 0, 0
+    for num in candidates:
+        if is_valid_aadhaar(num):
+            valid += 1
+        else:
+            invalid += 1
+
+    if invalid > 0:
+        return False, valid, invalid
+    return True, valid, 0
+
+
+def process_one_file(path: Path) -> Dict:
+    """
+    Read one file, decide for each line whether to keep or drop.
+    Return a dict with:
+      {
+        "file": str(path),
+        "kept_lines": [str, ...],
+        "lines_total": int,
+        "lines_kept": int,
+        "lines_dropped": int,
+        "candidates": int,
+        "valid": int,
+        "invalid": int,
+        "error": None|str
+      }
+    """
+    stats = {
+        "file": str(path),
+        "kept_lines": [],
+        "lines_total": 0,
+        "lines_kept": 0,
+        "lines_dropped": 0,
+        "candidates": 0,
+        "valid": 0,
+        "invalid": 0,
+        "error": None
+    }
+
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                stats["lines_total"] += 1
+                keep, v, inv = should_keep_line(line)
+                stats["valid"] += v
+                stats["invalid"] += inv
+                stats["candidates"] += (v + inv)
+
+                if keep:
+                    stats["lines_kept"] += 1
+                    stats["kept_lines"].append(line)
+                else:
+                    stats["lines_dropped"] += 1
+
+    except Exception as e:
+        stats["error"] = f"{type(e).__name__}: {e}"
+        # On error, we don't keep any lines from this file.
+        stats["kept_lines"] = []
+
+    return stats
+
+
+def find_txt_files(root: Path) -> List[Path]:
+    return sorted(root.rglob("*.txt"))
+
+
+# ---------- Chunk writer ----------
+class ChunkWriter:
+    def __init__(self, out_dir: Path, chunk_size: int):
+        self.out_dir = out_dir
+        self.chunk_size = chunk_size
+        self.current_count = 0
+        self.chunk_index = 1
+        self.current_fp = None
+        self.out_files = 0
+
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _open_new(self):
+        if self.current_fp:
+            self.current_fp.close()
+        name = f"chunk{self.chunk_index:04d}.txt"
+        self.current_fp = (self.out_dir / name).open("w", encoding="utf-8")
+        self.chunk_index += 1
+        self.current_count = 0
+        self.out_files += 1
+
+    def write_lines(self, lines: List[str]):
+        i = 0
+        while i < len(lines):
+            if self.current_fp is None or self.current_count >= self.chunk_size:
+                self._open_new()
+            can_write = min(self.chunk_size - self.current_count, len(lines) - i)
+            # Write a slice
+            slice_ = lines[i:i + can_write]
+            self.current_fp.writelines(slice_)
+            self.current_count += can_write
+            i += can_write
+
+    def close(self):
+        if self.current_fp:
+            self.current_fp.close()
+            self.current_fp = None
+
+
+# ---------- Main ----------
 def main():
     in_path = Path(INPUT_FOLDER)
     out_path = Path(OUTPUT_FOLDER)
@@ -65,55 +201,77 @@ def main():
 
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # 12 digits, not embedded within other digits
-    aadhaar_pattern = re.compile(r'(?<!\d)\d{12}(?!\d)')
+    files = find_txt_files(in_path)
 
-    files_scanned = 0
-    total_candidates = 0
-    total_valid = 0
-    total_invalid = 0
-    per_file = []
+    # Global counters
+    g_files = 0
+    g_errors = 0
+    g_lines_total = 0
+    g_lines_kept = 0
+    g_lines_dropped = 0
+    g_candidates = 0
+    g_valid = 0
+    g_invalid = 0
 
-    for txt in sorted(in_path.rglob("*.txt")):
-        files_scanned += 1
-        f_found = f_valid = f_invalid = 0
+    per_file_rows: List[str] = []
+    writer = ChunkWriter(out_path, CHUNK_LINES)
 
-        try:
-            with txt.open("r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    for num in aadhaar_pattern.findall(line):
-                        total_candidates += 1
-                        f_found += 1
-                        if is_valid_aadhaar(num):
-                            total_valid += 1
-                            f_valid += 1
-                        else:
-                            total_invalid += 1
-                            f_invalid += 1
-        except Exception:
-            traceback.print_exc()
-            per_file.append(f"{txt}: ERROR while reading (counted as 0/0/0)")
-            continue
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = [ex.submit(process_one_file, p) for p in files]
 
-        per_file.append(
-            f"{txt} -> candidates={f_found}, valid={f_valid}, invalid={f_invalid}"
-        )
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Cleaning files", unit="file"):
+            res = fut.result()
+            g_files += 1
+            g_lines_total += res["lines_total"]
+            g_lines_kept += res["lines_kept"]
+            g_lines_dropped += res["lines_dropped"]
+            g_candidates += res["candidates"]
+            g_valid += res["valid"]
+            g_invalid += res["invalid"]
 
-    with report_path.open("w", encoding="utf-8") as rf:
-        rf.write("===== Aadhaar Validation Report =====\n\n")
-        rf.write(f"Input folder   : {in_path}\n")
-        rf.write(f"Output folder  : {out_path}\n")
-        rf.write(f"Files scanned  : {files_scanned}\n\n")
+            if res["error"]:
+                g_errors += 1
+                per_file_rows.append(f'{res["file"]} -> ERROR: {res["error"]}')
+            else:
+                per_file_rows.append(
+                    f'{res["file"]} -> lines_total={res["lines_total"]}, kept={res["lines_kept"]}, '
+                    f'dropped_invalid={res["lines_dropped"]}, candidates={res["candidates"]}, '
+                    f'valid={res["valid"]}, invalid={res["invalid"]}'
+                )
+                # Write kept lines immediately to chunks, then free memory
+                if res["kept_lines"]:
+                    writer.write_lines(res["kept_lines"])
 
-        rf.write(f"Total candidates (12-digit): {total_candidates}\n")
-        rf.write(f"Valid Aadhaar              : {total_valid}\n")
-        rf.write(f"Invalid Aadhaar            : {total_invalid}\n\n")
+    writer.close()
 
-        rf.write("----- Per-file breakdown -----\n")
-        for row in per_file:
-            rf.write(row + "\n")
+    # Write summary
+    try:
+        with report_path.open("w", encoding="utf-8") as rf:
+            rf.write("===== Aadhaar Cleaning Summary =====\n\n")
+            rf.write(f"Input folder          : {in_path}\n")
+            rf.write(f"Output folder         : {out_path}\n")
+            rf.write(f"Output chunk size     : {CHUNK_LINES}\n")
+            rf.write(f"Output files written  : {writer.out_files}\n\n")
 
-    print(f"✅ Report written: {report_path}")
+            rf.write(f"Files scanned         : {g_files}\n")
+            rf.write(f"Files with errors     : {g_errors}\n\n")
+
+            rf.write(f"Total lines scanned   : {g_lines_total}\n")
+            rf.write(f"Lines kept            : {g_lines_kept}\n")
+            rf.write(f"Lines dropped (invalid Aadhaar present) : {g_lines_dropped}\n\n")
+
+            rf.write(f"Total candidates (12-digit) : {g_candidates}\n")
+            rf.write(f"Valid Aadhaar               : {g_valid}\n")
+            rf.write(f"Invalid Aadhaar             : {g_invalid}\n\n")
+
+            rf.write("----- Per-file breakdown -----\n")
+            for row in per_file_rows:
+                rf.write(row + "\n")
+    except Exception as e:
+        print(f"⚠️ Failed to write summary: {e}", file=sys.stderr)
+
+    print(f"✅ Done. Summary: {report_path}")
+
 
 if __name__ == "__main__":
     main()
