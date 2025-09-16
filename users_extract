@@ -12,14 +12,15 @@ from datetime import datetime
 from tqdm import tqdm
 
 # ========== CONFIGURATION ==========
-INPUT_FOLDER = "input_logs"         # <-- Hardcode your folder here
-OUTPUT_FOLDER = "output_users"
+INPUT_FOLDER = "input_logs"          # <-- Hardcode your folder here
+OUTPUT_FOLDER = "output_users"       # Combined extracted matches
+NEW_ORIGINAL_FOLDER = "new_original" # Mirror of input minus extracted lines
 SUMMARY_FILE = "summary_users.txt"
 CHUNK_SIZE = 10000
 MAX_WORKERS = 6
 ALLOWED_EXTS = (".txt",)
 
-# Match users=[<10–12 digits>] with optional spaces and commas
+# Regex to match users=[<10–12 digits>] with optional spaces/commas
 USERS_REGEX = re.compile(r"users\s*=\s*\[\s*(\d{10,12})\s*\]\s*,?", re.IGNORECASE)
 # ===================================
 
@@ -28,25 +29,24 @@ def find_txt_files(root: Path):
 
 def extract_users_line(line: str):
     """
-    Line format (split from RIGHT):
+    Input line format (split from RIGHT):
       log line ; path ; UNIDENTIFIED_FIELD ; mobile_regex ; mobile match
     """
     parts = [p.strip() for p in line.rsplit(";", 4)]
     if len(parts) != 5:
-        return None  # malformed
+        return None, False  # malformed
 
     logline, path_in_line, _unidentified, _regex_type, _mobile_match = parts
-
     m = USERS_REGEX.search(logline)
     if not m:
-        return None
+        return None, False
 
     number = m.group(1)
     extracted_log = f"users=[{number}]"
     formatted = f"{extracted_log} ; {path_in_line} ; users ; MOBILE_REGEX ; {number}"
-    return formatted, number
+    return (formatted, number), True
 
-def process_file(file_path: Path):
+def process_file(file_path: Path, input_root: Path):
     stats = {
         "lines_scanned": 0,
         "lines_written": 0,
@@ -54,35 +54,47 @@ def process_file(file_path: Path):
         "error": None,
         "blank": False
     }
-    outputs = []
+    extracted = []
+    cleaned_lines = []
     try:
         with file_path.open("r", encoding="utf-8", errors="ignore") as f:
             for raw in f:
                 line = raw.rstrip("\n")
                 stats["lines_scanned"] += 1
-                res = extract_users_line(line)
-                if res:
+                res, matched = extract_users_line(line)
+                if matched:
                     formatted, number = res
-                    outputs.append(formatted)
+                    extracted.append(formatted)
                     stats["lines_written"] += 1
                     stats["numbers"][number] += 1
+                else:
+                    cleaned_lines.append(line)
         if stats["lines_scanned"] == 0:
             stats["blank"] = True
     except Exception as e:
         stats["error"] = f"{file_path}: {e}"
-    return file_path, outputs, stats
 
-def write_chunks(outputs, base_name, out_dir):
+    # Write cleaned file into new_original/
+    rel_path = file_path.relative_to(input_root)
+    new_path = Path(NEW_ORIGINAL_FOLDER) / rel_path
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    with new_path.open("w", encoding="utf-8") as out_clean:
+        for l in cleaned_lines:
+            out_clean.write(l + "\n")
+
+    return file_path, extracted, stats
+
+def write_combined_chunks(all_outputs, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
     chunk_idx = 1
     line_count = 0
     writer = None
 
-    for line in outputs:
+    for line in all_outputs:
         if writer is None or line_count >= CHUNK_SIZE:
             if writer:
                 writer.close()
-            chunk_file = out_dir / f"{base_name}_chunk{chunk_idx:04d}.txt"
+            chunk_file = out_dir / f"combined_chunk{chunk_idx:04d}.txt"
             writer = chunk_file.open("w", encoding="utf-8")
             chunk_idx += 1
             line_count = 0
@@ -97,6 +109,7 @@ def write_summary(summary, numbers_counter):
         f.write(f"Generated: {datetime.now()}\n\n")
         f.write(f"Input folder       : {summary['input']}\n")
         f.write(f"Output folder      : {OUTPUT_FOLDER}\n")
+        f.write(f"New original folder: {NEW_ORIGINAL_FOLDER}\n")
         f.write(f"Files scanned      : {summary['files_scanned']}\n")
         f.write(f"Total lines scanned: {summary['lines_scanned']}\n")
         f.write(f"Total numbers found: {summary['total_found']}\n")
@@ -130,9 +143,10 @@ def main():
         "errors": []
     }
     numbers_counter = Counter()
+    all_extracted = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(process_file, f): f for f in txt_files}
+        futures = {ex.submit(process_file, f, input_folder): f for f in txt_files}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
             fpath, outputs, stats = fut.result()
             summary["files_scanned"] += 1
@@ -145,13 +159,14 @@ def main():
             if stats["error"]:
                 summary["errors"].append(stats["error"])
             numbers_counter.update(stats["numbers"])
-            if outputs:
-                base = fpath.stem
-                out_dir = Path(OUTPUT_FOLDER)
-                write_chunks(outputs, base, out_dir)
+            all_extracted.extend(outputs)
+
+    # Write combined extracted results
+    if all_extracted:
+        write_combined_chunks(all_extracted, Path(OUTPUT_FOLDER))
 
     write_summary(summary, numbers_counter)
-    print(f"\nDone. Summary written to {SUMMARY_FILE}")
+    print(f"\nDone. Extracted lines in {OUTPUT_FOLDER}, cleaned files in {NEW_ORIGINAL_FOLDER}, summary in {SUMMARY_FILE}")
 
 if __name__ == "__main__":
     main()
