@@ -7,7 +7,7 @@ import sys
 import traceback
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime
 from tqdm import tqdm
 
@@ -20,37 +20,88 @@ CHUNK_SIZE = 10000
 MAX_WORKERS = 6
 ALLOWED_EXTS = (".txt",)
 
-# Regex to match users=[<10–12 digits>] with optional spaces/commas
-USERS_REGEX = re.compile(r"users\s*=\s*\[\s*(\d{10,12})\s*\]\s*,?", re.IGNORECASE)
+# Mobile number detection: 10–12 digits, not embedded inside larger alphanumerics
+MOBILE_REGEX = r"(?<![A-Za-z0-9])(?:91)?[6-9]\d{9}(?![A-Za-z0-9])"
+
+# Keywords list (case-insensitive, flexible spacing)
+KEYWORDS = [
+    "mobile number", "mobile no", "mobileno",
+    "cust id", "customer id", "custid",
+    "phone number",
+    "account number", "account no", "account",
+    "cust", "customerid"
+]
 # ===================================
+
+# Precompile regexes for all case types
+PATTERNS = {
+    "bracket": re.compile(r"\b(\w+)\s*=\s*\[\s*(" + MOBILE_REGEX + r")\s*\]", re.IGNORECASE),
+    "coloncolon": re.compile(r"\b([\w\s]+?)\s*::\s*(" + MOBILE_REGEX + r")", re.IGNORECASE),
+    "hyphen": re.compile(r"\b([\w\s]+?)\s*-\s*(" + MOBILE_REGEX + r")", re.IGNORECASE),
+    "json": re.compile(r"[\"']\s*([\w\s]+?)\s*[\"']\s*:\s*[\"']?\s*(" + MOBILE_REGEX + r")\s*[\"']?", re.IGNORECASE),
+    # keyword pattern built dynamically
+}
+KEYWORD_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in KEYWORDS) + r")\b\s*(" + MOBILE_REGEX + r")",
+    re.IGNORECASE
+)
 
 def find_txt_files(root: Path):
     return sorted([p for p in root.rglob("*") if p.suffix in ALLOWED_EXTS])
 
-def extract_users_line(line: str):
-    """
-    Input line format (split from RIGHT):
-      log line ; path ; UNIDENTIFIED_FIELD ; mobile_regex ; mobile match
-    """
-    parts = [p.strip() for p in line.rsplit(";", 4)]
-    if len(parts) != 5:
-        return None, False  # malformed
+def normalize_field(field: str) -> str:
+    """Clean up and normalize field name (trim, collapse spaces)."""
+    return re.sub(r"\s+", " ", field.strip())
 
-    logline, path_in_line, _unidentified, _regex_type, _mobile_match = parts
-    m = USERS_REGEX.search(logline)
-    if not m:
-        return None, False
+def extract_from_logline(logline: str):
+    """
+    Scan a single log line for all known mobile extraction patterns.
+    Returns (formatted_line, number, field, case_type) or None.
+    """
+    # Case 1: bracket style users=[...]
+    m = PATTERNS["bracket"].search(logline)
+    if m:
+        field, number = normalize_field(m.group(1)), m.group(2)
+        formatted = f"{field}=[{number}]"
+        return formatted, number, field, "bracket"
 
-    number = m.group(1)
-    extracted_log = f"users=[{number}]"
-    formatted = f"{extracted_log} ; {path_in_line} ; users ; MOBILE_REGEX ; {number}"
-    return (formatted, number), True
+    # Case 2: colon-colon style
+    m = PATTERNS["coloncolon"].search(logline)
+    if m:
+        field, number = normalize_field(m.group(1)), m.group(2)
+        formatted = f"{field}=[{number}]"
+        return formatted, number, field, "coloncolon"
+
+    # Case 3: hyphen style
+    m = PATTERNS["hyphen"].search(logline)
+    if m:
+        field, number = normalize_field(m.group(1)), m.group(2)
+        formatted = f"{field}=[{number}]"
+        return formatted, number, field, "hyphen"
+
+    # Case 4: JSON-like style (with or without escaped quotes)
+    m = PATTERNS["json"].search(logline)
+    if m:
+        field, number = normalize_field(m.group(1)), m.group(2)
+        formatted = f"{field}=[{number}]"
+        return formatted, number, field, "json"
+
+    # Case 5: keyword style
+    m = KEYWORD_PATTERN.search(logline)
+    if m:
+        field, number = normalize_field(m.group(1)), m.group(2)
+        formatted = f"{field}=[{number}]"
+        return formatted, number, field, "keyword"
+
+    return None
 
 def process_file(file_path: Path, input_root: Path):
     stats = {
         "lines_scanned": 0,
-        "lines_written": 0,
+        "lines_extracted": 0,
+        "lines_remaining": 0,
         "numbers": Counter(),
+        "case_types": Counter(),
         "error": None,
         "blank": False
     }
@@ -61,16 +112,28 @@ def process_file(file_path: Path, input_root: Path):
             for raw in f:
                 line = raw.rstrip("\n")
                 stats["lines_scanned"] += 1
-                res, matched = extract_users_line(line)
-                if matched:
-                    formatted, number = res
-                    extracted.append(formatted)
-                    stats["lines_written"] += 1
+
+                # split from right for path etc.
+                parts = [p.strip() for p in line.rsplit(";", 4)]
+                if len(parts) != 5:
+                    cleaned_lines.append(line)
+                    continue
+                logline, path_in_line, _unid, _regex_type, _mobile_match = parts
+
+                res = extract_from_logline(logline)
+                if res:
+                    formatted, number, field, case_type = res
+                    outline = f"{formatted} ; {path_in_line} ; {field} ; MOBILE_REGEX ; {number}"
+                    extracted.append(outline)
+                    stats["lines_extracted"] += 1
                     stats["numbers"][number] += 1
+                    stats["case_types"][case_type] += 1
                 else:
                     cleaned_lines.append(line)
+
         if stats["lines_scanned"] == 0:
             stats["blank"] = True
+        stats["lines_remaining"] = len(cleaned_lines)
     except Exception as e:
         stats["error"] = f"{file_path}: {e}"
 
@@ -103,24 +166,28 @@ def write_combined_chunks(all_outputs, out_dir):
     if writer:
         writer.close()
 
-def write_summary(summary, numbers_counter):
+def write_summary(summary, numbers_counter, case_counter):
     with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
-        f.write(f"Summary Report - users extractor\n")
+        f.write("Summary Report - Mobile Extractor\n")
         f.write(f"Generated: {datetime.now()}\n\n")
-        f.write(f"Input folder       : {summary['input']}\n")
-        f.write(f"Output folder      : {OUTPUT_FOLDER}\n")
-        f.write(f"New original folder: {NEW_ORIGINAL_FOLDER}\n")
-        f.write(f"Files scanned      : {summary['files_scanned']}\n")
-        f.write(f"Total lines scanned: {summary['lines_scanned']}\n")
-        f.write(f"Total numbers found: {summary['total_found']}\n")
-        f.write(f"Total lines written: {summary['lines_written']}\n")
-        f.write(f"Lines skipped (no match): {summary['lines_skipped']}\n")
-        f.write(f"Blank files        : {summary['blank_files']}\n")
-        f.write(f"Errors             : {len(summary['errors'])}\n")
-        if summary['errors']:
+        f.write(f"Input folder        : {summary['input']}\n")
+        f.write(f"Output folder       : {OUTPUT_FOLDER}\n")
+        f.write(f"New original folder : {NEW_ORIGINAL_FOLDER}\n")
+        f.write(f"Files scanned       : {summary['files_scanned']}\n")
+        f.write(f"Total lines scanned : {summary['lines_scanned']}\n")
+        f.write(f"Total extracted     : {summary['lines_extracted']}\n")
+        f.write(f"Total new_original  : {summary['lines_remaining']}\n")
+        f.write(f"Blank files         : {summary['blank_files']}\n")
+        f.write(f"Errors              : {len(summary['errors'])}\n")
+        if summary["errors"]:
             f.write("Error details:\n")
-            for e in summary['errors']:
+            for e in summary["errors"]:
                 f.write(f"  - {e}\n")
+
+        f.write("\nPer-case breakdown:\n")
+        for case, count in case_counter.items():
+            f.write(f"  {case} : {count}\n")
+
         f.write("\nPer-number frequency:\n")
         for num, count in numbers_counter.most_common():
             f.write(f"  {num} : {count}\n")
@@ -136,13 +203,13 @@ def main():
         "input": str(input_folder),
         "files_scanned": 0,
         "lines_scanned": 0,
-        "total_found": 0,
-        "lines_written": 0,
-        "lines_skipped": 0,
+        "lines_extracted": 0,
+        "lines_remaining": 0,
         "blank_files": 0,
         "errors": []
     }
     numbers_counter = Counter()
+    case_counter = Counter()
     all_extracted = []
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -151,21 +218,20 @@ def main():
             fpath, outputs, stats = fut.result()
             summary["files_scanned"] += 1
             summary["lines_scanned"] += stats["lines_scanned"]
-            summary["lines_written"] += stats["lines_written"]
-            summary["total_found"] += sum(stats["numbers"].values())
-            summary["lines_skipped"] += stats["lines_scanned"] - stats["lines_written"]
+            summary["lines_extracted"] += stats["lines_extracted"]
+            summary["lines_remaining"] += stats["lines_remaining"]
             if stats["blank"]:
                 summary["blank_files"] += 1
             if stats["error"]:
                 summary["errors"].append(stats["error"])
             numbers_counter.update(stats["numbers"])
+            case_counter.update(stats["case_types"])
             all_extracted.extend(outputs)
 
-    # Write combined extracted results
     if all_extracted:
         write_combined_chunks(all_extracted, Path(OUTPUT_FOLDER))
 
-    write_summary(summary, numbers_counter)
+    write_summary(summary, numbers_counter, case_counter)
     print(f"\nDone. Extracted lines in {OUTPUT_FOLDER}, cleaned files in {NEW_ORIGINAL_FOLDER}, summary in {SUMMARY_FILE}")
 
 if __name__ == "__main__":
