@@ -19,25 +19,32 @@ CHUNK_SIZE = 10000
 MAX_WORKERS = 6
 ALLOWED_EXTS = (".txt",)
 
-# Match users=[<10–12 digit number>] with optional spaces/commas around
-USERS_REGEX = re.compile(r"users=\[(\d{10,12})\]")
+# Match users=[<10–12 digits>] with optional spaces and commas
+USERS_REGEX = re.compile(r"users\s*=\s*\[\s*(\d{10,12})\s*\]\s*,?", re.IGNORECASE)
 # ===================================
 
 def find_txt_files(root: Path):
     return sorted([p for p in root.rglob("*") if p.suffix in ALLOWED_EXTS])
 
-def extract_users_line(line: str, path: str):
+def extract_users_line(line: str):
     """
-    Extracts the first users=[<number>] from the line.
-    Returns formatted output line or None if not found.
+    Line format (split from RIGHT):
+      log line ; path ; UNIDENTIFIED_FIELD ; mobile_regex ; mobile match
     """
-    m = USERS_REGEX.search(line)
+    parts = [p.strip() for p in line.rsplit(";", 4)]
+    if len(parts) != 5:
+        return None  # malformed
+
+    logline, path_in_line, _unidentified, _regex_type, _mobile_match = parts
+
+    m = USERS_REGEX.search(logline)
     if not m:
         return None
+
     number = m.group(1)
-    # Only include users=[...] in the "logline" part
-    extracted = f"users=[{number}] ; {path} ; users ; MOBILE_REGEX ; {number}"
-    return extracted, number
+    extracted_log = f"users=[{number}]"
+    formatted = f"{extracted_log} ; {path_in_line} ; users ; MOBILE_REGEX ; {number}"
+    return formatted, number
 
 def process_file(file_path: Path):
     stats = {
@@ -53,7 +60,7 @@ def process_file(file_path: Path):
             for raw in f:
                 line = raw.rstrip("\n")
                 stats["lines_scanned"] += 1
-                res = extract_users_line(line, str(file_path))
+                res = extract_users_line(line)
                 if res:
                     formatted, number = res
                     outputs.append(formatted)
