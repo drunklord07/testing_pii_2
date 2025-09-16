@@ -1,14 +1,102 @@
-AADHAAR_RE = re.compile(
-    r'(?<![A-Za-z0-9])'      # no alpha/digit just before
-    r'[2-9][0-9]{11}'        # 12 digits, first between 2–9
-    r'(?![A-Za-z0-9])'       # no alpha/digit just after
-)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+import os
+import re
+import sys
+import traceback
+from pathlib import Path
+from functools import lru_cache
 
+# ========== Aadhaar Verhoeff Check ==========
+@lru_cache(maxsize=10000)
+def is_valid_aadhaar(number: str) -> bool:
+    if len(number) != 12 or not number.isdigit():
+        return False
+    mul = [
+        [0,1,2,3,4,5,6,7,8,9],
+        [1,2,3,4,0,6,7,8,9,5],
+        [2,3,4,0,1,7,8,9,5,6],
+        [3,4,0,1,2,8,9,5,6,7],
+        [4,0,1,2,3,9,5,6,7,8],
+        [5,9,8,7,6,0,4,3,2,1],
+        [6,5,9,8,7,1,0,4,3,2],
+        [7,6,5,9,8,2,1,0,4,3],
+        [8,7,6,5,9,3,2,1,0,4],
+        [9,8,7,6,5,4,3,2,1,0]
+    ]
+    perm = [
+        [0,1,2,3,4,5,6,7,8,9],
+        [1,5,7,6,2,8,3,0,9,4],
+        [5,8,0,3,7,9,6,1,4,2],
+        [8,9,1,6,0,4,3,5,2,7],
+        [9,4,5,3,1,2,6,8,7,0],
+        [4,2,8,6,5,7,3,9,0,1],
+        [2,7,9,3,8,0,6,4,1,5],
+        [7,0,4,6,9,1,3,2,5,8]
+    ]
+    inv = [0,4,3,2,1,5,6,7,8,9]
+    c = 0
+    for i, ch in enumerate(reversed(number)):
+        c = mul[c][perm[i % 8][int(ch)]]
+    return inv[c] == 0
 
-VOTERID_RE = re.compile(
-    r'(?<![A-Za-z0-9])'      # no alpha/digit before
-    r'[A-Z]{3}[0-9]{7}'      # 3 letters + 7 digits
-    r'(?![A-Za-z0-9])',      # no alpha/digit after
-    re.IGNORECASE
-)
+# ========== Main Script ==========
+def main():
+    input_folder = input("Enter input folder path: ").strip()
+    in_path = Path(input_folder)
+    if not in_path.exists():
+        print(f"❌ Input folder not found: {in_path}")
+        sys.exit(1)
+
+    output_folder = Path("output")
+    output_folder.mkdir(exist_ok=True)
+    report_file = output_folder / "aadhaar_report.txt"
+
+    aadhaar_pattern = re.compile(r"\b\d{12}\b")
+
+    total_found = 0
+    total_valid = 0
+    total_invalid = 0
+    per_file_stats = []
+
+    for txt_file in sorted(in_path.rglob("*.txt")):
+        file_found = 0
+        file_valid = 0
+        file_invalid = 0
+
+        try:
+            with txt_file.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    for match in aadhaar_pattern.findall(line):
+                        total_found += 1
+                        file_found += 1
+                        if is_valid_aadhaar(match):
+                            total_valid += 1
+                            file_valid += 1
+                        else:
+                            total_invalid += 1
+                            file_invalid += 1
+        except Exception as e:
+            traceback.print_exc()
+            continue
+
+        per_file_stats.append(
+            f"{txt_file.name}: found={file_found}, valid={file_valid}, invalid={file_invalid}"
+        )
+
+    # ===== Write Report =====
+    with report_file.open("w", encoding="utf-8") as rf:
+        rf.write("===== Aadhaar Validation Report =====\n\n")
+        rf.write(f"Total Aadhaar candidates found: {total_found}\n")
+        rf.write(f"Valid Aadhaar numbers: {total_valid}\n")
+        rf.write(f"Invalid Aadhaar numbers: {total_invalid}\n\n")
+
+        rf.write("----- Per File Stats -----\n")
+        for stat in per_file_stats:
+            rf.write(stat + "\n")
+
+    print(f"✅ Report written to: {report_file}")
+
+if __name__ == "__main__":
+    main()
