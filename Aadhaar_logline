@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import traceback
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+from collections import Counter, defaultdict
+
+# ========= CONFIGURATION ========= #
+REFERENCE_FILE = "reference.txt"     # Input reference file with path ; field ; regex type ; match
+INPUT_FOLDER = "input_logs"          # Folder containing .txt files to scan
+OUTPUT_FOLDER = "matched_output"     # Folder where matched lines will be written
+SUMMARY_FILE = "summary_report.txt"  # Final summary
+MAX_WORKERS = 4                      # Parallel workers
+CHUNK_SIZE = 10000                   # Lines per output chunk
+ALLOWED_EXTS = (".txt",)             # Only process .txt files
+# ================================= #
+
+# Load reference keys
+def load_reference_keys(reference_file):
+    keys = set()
+    with open(reference_file, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                keys.add(line)
+    return keys
+
+
+# Extract the last 4 fields (path ; field ; regex type ; match)
+def extract_key(line):
+    parts = line.strip().split(";")
+    if len(parts) < 5:
+        return None
+    return ";".join(p.strip() for p in parts[-4:])  # last 4 fields
+
+
+# Process one file
+def process_file(file_path, ref_keys):
+    results = []
+    match_counts = Counter()
+    total_lines = 0
+    duplicates = 0
+    seen_lines = set()
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                total_lines += 1
+                key = extract_key(line)
+                if key and key in ref_keys:
+                    results.append(line.strip())
+                    match_counts[key] += 1
+                    if line.strip() in seen_lines:
+                        duplicates += 1
+                    else:
+                        seen_lines.add(line.strip())
+    except Exception as e:
+        return {"error": f"{file_path}: {e}", "results": [], "counts": Counter(), "total": 0, "duplicates": 0}
+
+    return {"results": results, "counts": match_counts, "total": total_lines, "duplicates": duplicates}
+
+
+# Write output in chunks
+def write_output(lines, output_folder, chunk_size):
+    os.makedirs(output_folder, exist_ok=True)
+    chunk_idx = 1
+    count = 0
+    out_file = None
+    out_fh = None
+
+    for line in lines:
+        if count % chunk_size == 0:
+            if out_fh:
+                out_fh.close()
+            out_file = os.path.join(output_folder, f"chunk{chunk_idx:04d}.txt")
+            out_fh = open(out_file, "w", encoding="utf-8")
+            chunk_idx += 1
+        out_fh.write(line + "\n")
+        count += 1
+
+    if out_fh:
+        out_fh.close()
+    return count, chunk_idx - 1
+
+
+# Write summary
+def write_summary(summary_data, match_counter, errors):
+    with open(SUMMARY_FILE, "w", encoding="utf-8") as f:
+        f.write("====== MATCH SUMMARY REPORT ======\n\n")
+        f.write(f"Reference file: {REFERENCE_FILE}\n")
+        f.write(f"Input folder:   {INPUT_FOLDER}\n")
+        f.write(f"Output folder:  {OUTPUT_FOLDER}\n\n")
+
+        f.write(f"Files scanned:  {summary_data['files_scanned']}\n")
+        f.write(f"Total lines:    {summary_data['total_lines']}\n")
+        f.write(f"Total matches:  {summary_data['total_matches']}\n")
+        f.write(f"Output lines:   {summary_data['output_lines']}\n")
+        f.write(f"Duplicates:     {summary_data['duplicates']}\n\n")
+
+        f.write("---- Match Counts Per Key ----\n")
+        f.write("path ; field ; regex type ; match ; count\n")
+        for key, cnt in match_counter.items():
+            f.write(f"{key} ; {cnt}\n")
+        f.write("\n")
+
+        if errors:
+            f.write("---- Errors ----\n")
+            for e in errors:
+                f.write(e + "\n")
+
+
+# Main
+def main():
+    try:
+        ref_keys = load_reference_keys(REFERENCE_FILE)
+        if not ref_keys:
+            print("No keys found in reference file.")
+            return
+
+        input_files = [p for p in Path(INPUT_FOLDER).glob("*.txt") if p.suffix in ALLOWED_EXTS]
+        if not input_files:
+            print("No input .txt files found.")
+            return
+
+        all_results = []
+        global_counter = Counter()
+        errors = []
+        total_lines = 0
+        total_matches = 0
+        total_duplicates = 0
+
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_file, str(f), ref_keys): f for f in input_files}
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+                try:
+                    res = fut.result()
+                    if "error" in res:
+                        errors.append(res["error"])
+                        continue
+                    all_results.extend(res["results"])
+                    global_counter.update(res["counts"])
+                    total_lines += res["total"]
+                    total_matches += sum(res["counts"].values())
+                    total_duplicates += res["duplicates"]
+                except Exception as e:
+                    errors.append(f"{futures[fut]}: {traceback.format_exc()}")
+
+        # Write outputs
+        out_count, chunks = write_output(all_results, OUTPUT_FOLDER, CHUNK_SIZE)
+
+        summary_data = {
+            "files_scanned": len(input_files),
+            "total_lines": total_lines,
+            "total_matches": total_matches,
+            "output_lines": out_count,
+            "duplicates": total_duplicates,
+        }
+        write_summary(summary_data, global_counter, errors)
+
+        print(f"\nDone. Matches written to {OUTPUT_FOLDER} in {chunks} chunks.")
+        print(f"Summary saved to {SUMMARY_FILE}")
+
+    except Exception as e:
+        print("Fatal error:", e)
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
