@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
-from collections import Counter, defaultdict
+from collections import Counter
 
 # ========= CONFIGURATION ========= #
 REFERENCE_FILE = "reference.txt"     # Input reference file with path ; field ; regex type ; match
@@ -19,23 +19,26 @@ CHUNK_SIZE = 10000                   # Lines per output chunk
 ALLOWED_EXTS = (".txt",)             # Only process .txt files
 # ================================= #
 
-# Load reference keys
+
+# -------- Utility Functions -------- #
+
+# Load reference keys (normalize: strip + lowercase)
 def load_reference_keys(reference_file):
     keys = set()
     with open(reference_file, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            line = line.strip()
-            if line:
-                keys.add(line)
+            parts = [p.strip().lower() for p in line.strip().split(";")]
+            if len(parts) >= 4:
+                keys.add(";".join(parts[-4:]))  # strictly last 4 fields
     return keys
 
 
-# Extract the last 4 fields (path ; field ; regex type ; match)
+# Extract the last 4 fields from a log line
 def extract_key(line):
-    parts = line.strip().split(";")
-    if len(parts) < 5:
+    parts = [p.strip().lower() for p in line.strip().split(";")]
+    if len(parts) < 5:  # log line + path + field + regex type + match
         return None
-    return ";".join(p.strip() for p in parts[-4:])  # last 4 fields
+    return ";".join(parts[-4:])
 
 
 # Process one file
@@ -113,7 +116,7 @@ def write_summary(summary_data, match_counter, errors):
                 f.write(e + "\n")
 
 
-# Main
+# -------- Main -------- #
 def main():
     try:
         ref_keys = load_reference_keys(REFERENCE_FILE)
